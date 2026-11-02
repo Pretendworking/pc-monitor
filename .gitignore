@@ -1,0 +1,31 @@
+# Local Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Personal settings, local state and credentials
+pc_monitor_settings.json
+pc_monitor_settings.tmp
+pc_monitor.lock
+pc_monitor_cameras.*
+.env
+.env.*
+*.dat
+*.log
+*.bak
+*.tmp
+
+# Build products and local shortcuts
+*.exe
+*.lnk
+build/
+dist/
+work/
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
