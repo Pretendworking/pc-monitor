@@ -4,6 +4,14 @@ A standalone PySide6 desktop widget for Windows. It shows live computer readings
 
 ## Features
 
+- Cyber-tech dashboard with CPU/GPU/RAM/disk cards, a network graph, and a separate apps/sensors column. **Widget view** returns to the narrow reorderable list; both window sizes are remembered.
+- Dashboard status strip distinguishes current resource pressure from sensor-provider availability. **All graphs** changes every time range together; individual cards can still be adjusted separately.
+- **Export CSV** saves up to one hour of actual collected samples with UTC timestamps, units, and explicit unavailable values. Export stays local and excludes process lists. History is cleared when the app restarts.
+- Click CPU, RAM, disk space or GPU headings to expand details and a history graph. Expanded cards are remembered. Choose 5 minutes, 30 minutes or 1 hour; hover for exact recorded values and sample times.
+- Expand Network Speed for download/upload history in Mbps. Changing adapters starts a fresh network history.
+- History stays in memory only, starts when the widget opens, and leaves gaps for unavailable samples or pauses longer than 15 seconds.
+- **What’s slowing my PC?** opens live resource readings and the top three apps by CPU and RAM. High-use hints describe the latest sample, not a confirmed diagnosis. Disk capacity is kept distinct from disk activity.
+- Device-reported warning and critical temperatures are labeled reference limits, separately from current temperatures.
 - CPU and RAM usage, disk space and GPU usage.
 - Blue usage bars below 50%, yellow from 50% to below 80%, red at 80% and above.
 - Fahrenheit hardware temperatures when supported, displayed without averaging.

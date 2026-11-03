@@ -1,4 +1,5 @@
 import importlib.util
+import csv
 import json
 import os
 from pathlib import Path
@@ -92,11 +93,87 @@ class Widget(unittest.TestCase):
     def setUpClass(cls):
         cls.app = m.QApplication.instance() or m.QApplication([])
 
+    def test_history_preserves_gaps_and_bounds_memory(self):
+        graph = m.HistoryGraph()
+        graph.add_sample((10,), timestamp=100)
+        graph.add_sample((None,), timestamp=101)
+        graph.add_sample((30,), timestamp=102)
+        graph.add_sample((40,), timestamp=130)
+        self.assertEqual(graph.segments(0, 130), [[(100, 10)], [(102, 30)], [(130, 40)]])
+        graph.add_sample((float('nan'),), timestamp=131)
+        self.assertIsNone(graph.samples[-1][1][0])
+        graph.samples.clear()
+        for stamp in range(4000):
+            graph.add_sample((stamp % 100,), timestamp=stamp)
+        self.assertLessEqual(len(graph.samples), 3601)
+        self.assertEqual(graph.samples[0][0], 399)
+        graph.range_selector.setCurrentIndex(2)
+        self.assertEqual(graph.window, 3600)
+        self.assertEqual(graph.sample_at(1000), (1000, (0,)))
+        graph.range_selector.setCurrentIndex(0)
+        self.assertTrue(all(t >= 3699 for segment in graph.segments(0, 3999) for t, _ in segment))
+        self.assertIsNone(graph.sample_at(0))
+        graph.close()
+
+    def test_resource_report_updates_and_reopens_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(m, 'CONFIG', Path(directory) / 'settings.json'), \
+             patch.object(m, 'Sensors', FakeSensors):
+            widget = m.Monitor()
+            try:
+                widget.current_readings = dict(cpu=95, ram=90, disk=50, gpu=None)
+                widget.current_sensor_data = dict(top_cpu=[dict(name='<Example>', cpu=45)],
+                                                  top_ram=[dict(name='Example', ram=2**30)])
+                widget.open_diagnostics()
+                dialog = widget.diagnostic_dialog
+                text = '\n'.join(label.text() for label in dialog.findChildren(m.QLabel))
+                self.assertIn('Memory use is high', text)
+                self.assertIn('<Example> — 45.0%', text)
+                self.assertIn('GPU N/A', text)
+                widget.open_diagnostics()
+                self.assertIs(widget.diagnostic_dialog, dialog)
+                dialog.close()
+                self.assertIsNone(widget.diagnostic_dialog)
+                widget.open_diagnostics()
+                widget.diagnostic_dialog.close()
+            finally:
+                widget.close()
+
+    def test_pressure_report_distinguishes_missing_normal_and_high(self):
+        self.assertIn('Waiting', m.pressure_summary({}))
+        self.assertIn('No high', m.pressure_summary(dict(cpu=20, ram=50, disk=60, gpu=None)))
+        self.assertIn('nearly full', m.pressure_summary(dict(disk=95)))
+        self.assertNotIn('CPU is busy', m.pressure_summary(dict(cpu=float('nan'))))
+
+    def test_expand_history_persists_and_refreshes_while_collapsed(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(m, 'CONFIG', Path(directory) / 'settings.json'), \
+             patch.object(m, 'Sensors', FakeSensors):
+            m.CONFIG.write_text(json.dumps(dict(m.DEFAULTS, dashboard=False)), encoding='utf-8')
+            widget = m.Monitor()
+            widget.show()
+            try:
+                meter = widget.meters['cpu']
+                self.assertTrue(meter.graph.isHidden())
+                meter.toggle.click()
+                self.app.processEvents()
+                self.assertFalse(meter.graph.isHidden())
+                self.assertTrue(m.load_settings()['history_cpu'])
+                meter.graph.grab()  # Exercise real Qt painting.
+                meter.toggle.click()
+                count = len(meter.graph.samples)
+                widget.refresh()
+                self.assertGreater(len(meter.graph.samples), count)
+                self.assertTrue(meter.graph.isHidden())
+                widget.network_graph.grab()
+            finally:
+                widget.close()
+
     def test_settings_migration_reorder_and_visibility(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(m, 'CONFIG', Path(directory) / 'settings.json'), \
              patch.object(m, 'Sensors', FakeSensors):
-            m.CONFIG.write_text(json.dumps(dict(m.DEFAULTS, separate_panels=True)), encoding='utf-8')
+            m.CONFIG.write_text(json.dumps(dict(m.DEFAULTS, separate_panels=True, dashboard=False)), encoding='utf-8')
             widget = m.Monitor()
             widget.show()
             self.app.processEvents()
@@ -114,6 +191,73 @@ class Widget(unittest.TestCase):
                 dialog.close()
             finally:
                 widget.close()
+
+    def test_dashboard_switch_preserves_history_and_visibility(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(m, 'CONFIG', Path(directory) / 'settings.json'), \
+             patch.object(m, 'Sensors', FakeSensors):
+            widget = m.Monitor()
+            widget.show()
+            self.app.processEvents()
+            try:
+                self.assertTrue(widget.options['dashboard'])
+                self.assertIs(widget.dashboard_grid.itemAtPosition(0, 0).widget(), widget.meters['cpu'])
+                self.assertIs(widget.dashboard_grid.itemAtPosition(0, 1).widget(), widget.meters['gpu'])
+                self.assertFalse(widget.meters['cpu'].graph.isHidden())
+                count = len(widget.meters['cpu'].graph.samples)
+                widget.toggle_dashboard()
+                self.assertFalse(widget.options['dashboard'])
+                self.assertIs(widget.content_layout.itemAt(0).widget(), widget.meters['cpu'])
+                self.assertEqual(len(widget.meters['cpu'].graph.samples), count)
+                widget.options['show_gpu'] = False
+                widget.toggle_dashboard()
+                self.assertTrue(widget.meters['gpu'].isHidden())
+                self.assertTrue(m.load_settings()['dashboard'])
+                widget.grab()
+            finally:
+                widget.close()
+
+    def test_shared_range_mixed_state_and_csv_export(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(m, 'CONFIG', Path(directory) / 'settings.json'), \
+             patch.object(m, 'Sensors', FakeSensors):
+            widget = m.Monitor()
+            try:
+                widget.global_range.setCurrentIndex(2)
+                self.assertTrue(all(graph.window == 3600 for graph in widget.history_graphs().values()))
+                widget.meters['cpu'].graph.range_selector.setCurrentIndex(0)
+                self.assertEqual(widget.global_range.currentIndex(), -1)
+                widget.global_range.setCurrentIndex(0)
+                self.assertTrue(all(graph.window == 300 for graph in widget.history_graphs().values()))
+                now = m.time.monotonic()
+                graph = widget.meters['cpu'].graph
+                graph.add_sample((None,), timestamp=now)
+                graph.add_sample((12.5,), timestamp=now)
+                output = Path(directory) / 'readings.csv'
+                with patch.object(m.QFileDialog, 'getSaveFileName', return_value=(str(output), 'CSV')), \
+                     patch.object(m.QMessageBox, 'information'):
+                    widget.export_history()
+                with output.open(encoding='utf-8-sig', newline='') as saved:
+                    rows = list(csv.DictReader(saved))
+                cpu = [row for row in rows if row['metric'] == 'cpu']
+                self.assertTrue(any(row['value'] == '' and row['status'] == 'unavailable' for row in cpu))
+                self.assertTrue(any(row['value'] == '12.5' for row in cpu))
+                self.assertTrue(all(row['timestamp_utc'].endswith('+00:00') for row in rows))
+                self.assertTrue(widget.options['dashboard'])
+            finally:
+                widget.close()
+
+    def test_sensor_status_and_export_window(self):
+        self.assertEqual(m.sensor_status({}), 'SENSORS UNAVAILABLE')
+        self.assertEqual(m.sensor_status(dict(hardware=[{}], hardware_age=1)), 'SENSORS LIVE')
+        self.assertEqual(m.sensor_status(dict(hardware=[{}], hardware_age=4)), 'SENSORS DELAYED')
+        graph = m.HistoryGraph()
+        graph.samples.extend([(1, (5,)), (4999, (None,)), (5000, (30,)), (5001, (40,))])
+        rows = m.history_rows({'cpu': graph}, now=5000)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][-1], 'unavailable')
+        self.assertEqual(rows[1][3], 30)
+        graph.close()
 
 
 if __name__ == '__main__':

@@ -5,6 +5,8 @@ Monitor with WMI enabled. NVIDIA GPUs also use nvidia-smi when available.
 Disk percentage means system-drive space used, not disk activity.
 """
 import csv
+from collections import deque
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -18,14 +20,14 @@ import urllib.request
 from pathlib import Path
 
 import psutil
-from PySide6.QtCore import Qt, QTimer, QLockFile, QMimeData
-from PySide6.QtGui import QColor, QPainter, QPen, QIcon, QDrag
+from PySide6.QtCore import Qt, QTimer, QLockFile, QMimeData, QPointF, QRectF
+from PySide6.QtGui import QColor, QPainter, QPen, QIcon, QDrag, QPainterPath, QLinearGradient
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QProgressBar,
                                QPushButton, QVBoxLayout, QWidget, QDialog,
                                QFormLayout, QSpinBox, QCheckBox, QComboBox,
                                QDialogButtonBox, QMessageBox, QScrollArea,
-                               QToolButton, QFrame, QTabWidget)
+                               QToolButton, QFrame, QTabWidget, QToolTip, QGridLayout, QSizePolicy, QLayout, QFileDialog)
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / 'pc_monitor_settings.json'
@@ -42,6 +44,8 @@ MONITORS = [('cpu', 'CPU usage and temperature'), ('ram', 'RAM usage'),
 DEFAULTS.update({'show_' + key: True for key, _ in MONITORS})
 DEFAULTS.update(separate_panels=False, panel_positions={}, monitor_order=[key for key, _ in MONITORS])
 DEFAULTS.update(network_adapter='', network_unit='Mbps')
+DEFAULTS.update(history_cpu=False, history_ram=False, history_disk=False, history_gpu=False)
+DEFAULTS.update(dashboard=True, dashboard_width=1100, dashboard_height=780)
 def set_windows_startup(enabled):
     """Called only when the user saves a changed Start with Windows setting."""
     if os.name != 'nt':
@@ -92,8 +96,8 @@ class SettingsDialog(QDialog):
         super().__init__(monitor)
         self.setWindowTitle('PC Monitor settings')
         self.setMinimumWidth(360)
-        self.setStyleSheet('QDialog {background: #151e2c; color: #e6edf8;}'
-                          'QLabel,QCheckBox {color: #e6edf8; font-size: 13px;}'
+        self.setStyleSheet('QDialog {background: #151e2c; color: #d9f6ff;}'
+                          'QLabel,QCheckBox {color: #d9f6ff; font-size: 13px;}'
                           'QSpinBox,QComboBox {background: #273449; color: white; padding: 6px;}'
                           'QPushButton {background: #293e59; color: white; padding: 8px 14px; border-radius: 5px;}')
         layout = QVBoxLayout(self)
@@ -173,7 +177,7 @@ class SettingsDialog(QDialog):
         note.setWordWrap(True)
         note.setStyleSheet('color: #9cabbd; font-size: 11px;')
         layout.addWidget(note)
-        sensor_help = QLabel('<a style="color:#7ac2ff" href="https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases">Get Libre Hardware Monitor for GPU temperatures</a>')
+        sensor_help = QLabel('<a style="color:#51e0ef" href="https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases">Get Libre Hardware Monitor for GPU temperatures</a>')
         sensor_help.setWordWrap(True)
         sensor_help.setOpenExternalLinks(True)
         sensor_help.setToolTip('In Libre Hardware Monitor: Options → Remote Web Server → Run. Default port: 8085. Leave it running.')
@@ -598,7 +602,7 @@ class RowDragHandle(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor('#7ac2ff'))
+        painter.setBrush(QColor('#51e0ef'))
         for x in (7, 14):
             for y in (-5, 0, 5):
                 painter.drawEllipse(x, self.height() // 2 + y - 1, 3, 3)
@@ -693,18 +697,160 @@ class ReorderList(QWidget):
         super().paintEvent(event)
         if self.drop_y is not None:
             painter = QPainter(self)
-            painter.setPen(QPen(QColor('#7ac2ff'), 2))
+            painter.setPen(QPen(QColor('#51e0ef'), 2))
             painter.drawLine(0, round(self.drop_y), self.width(), round(self.drop_y))
 
 
-class Meter(QWidget):
-    def __init__(self, title):
+class HistoryGraph(QWidget):
+    """Bounded, timestamped local history. Missing samples break the line."""
+    WINDOW = 300
+
+    def __init__(self, series=('Usage',), unit='%', ceiling=100):
         super().__init__()
+        self.series, self.unit, self.ceiling = series, unit, ceiling
+        self.samples = deque(maxlen=7202)
+        self.window = self.WINDOW
+        self.hover_x = None
+        self.clock_offset = time.time() - time.monotonic()
+        self.setMouseTracking(True)
+        self.range_selector = QComboBox(self)
+        for label, seconds in [('5 min', 300), ('30 min', 1800), ('1 hour', 3600)]:
+            self.range_selector.addItem(label, seconds)
+        self.range_selector.setGeometry(8, 3, 82, 23)
+        self.range_selector.setAccessibleName('History time range')
+        self.range_selector.setStyleSheet('QComboBox {color: #7be8fa; background: #0a2430; border: 0; border-radius: 4px; padding: 2px 5px; font-size: 11px;} QComboBox QAbstractItemView {color: #d9f6ff; background: #0a2430;}')
+        self.range_selector.currentIndexChanged.connect(self.change_range)
+        self.setMinimumHeight(155)
+        self.setToolTip('Hover to inspect exact samples. History is collected while PC Monitor runs; gaps mean unavailable readings.')
+        self.setAccessibleName('Live ' + ' and '.join(series) + ' history')
+
+    def change_range(self, index):
+        self.window = self.range_selector.itemData(index)
+        self.update()
+
+    def sample_at(self, timestamp):
+        if not self.samples:
+            return None
+        closest = min(self.samples, key=lambda sample: abs(sample[0] - timestamp))
+        return closest if abs(closest[0] - timestamp) <= 15 else None
+
+    def mouseMoveEvent(self, event):
+        self.hover_x = max(12, min(self.width() - 12, event.position().x()))
+        target = time.monotonic() - (self.width() - 12 - self.hover_x) / max(1, self.width() - 24) * self.window
+        sample = self.sample_at(target)
+        if sample is None:
+            text = 'No sample here — history starts when the app opens.'
+        else:
+            stamp, values = sample
+            clock = time.strftime('%H:%M:%S', time.localtime(stamp + self.clock_offset))
+            readings = '\n'.join(f'{name}: ' + ('N/A' if value is None else f'{value:.2f} {self.unit}')
+                                 for name, value in zip(self.series, values))
+            text = clock + '\n' + readings
+        QToolTip.showText(event.globalPosition().toPoint(), text, self)
+        self.update()
+        event.accept()
+
+    def leaveEvent(self, event):
+        self.hover_x = None
+        QToolTip.hideText()
+        self.update()
+
+    def add_sample(self, values, timestamp=None):
+        now = time.monotonic() if timestamp is None else timestamp
+        cleaned = tuple(number(value) for value in values)
+        if len(cleaned) != len(self.series):
+            raise ValueError('One value is required for each series')
+        self.samples.append((now, cleaned))
+        while self.samples and self.samples[0][0] < now - 3600:
+            self.samples.popleft()
+        self.update()
+
+    def segments(self, index, now):
+        """Do not bridge sensor gaps, sleep, or missed refresh intervals."""
+        segments, segment, previous = [], [], None
+        for stamp, values in self.samples:
+            if stamp < now - self.window:
+                continue
+            value = values[index]
+            if value is None or (previous is not None and stamp - previous > 15):
+                if segment:
+                    segments.append(segment)
+                segment = []
+            if value is not None:
+                segment.append((stamp, value))
+            previous = stamp
+        if segment:
+            segments.append(segment)
+        return segments
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#07151e'))
+        painter.drawRoundedRect(QRectF(self.rect()), 8, 8)
+        plot = QRectF(12, 26, max(20, self.width() - 24), self.height() - 65)
+        now = time.monotonic()
+        available = [v for t, values in self.samples if t >= now - self.window
+                     for v in values if v is not None]
+        ceiling = self.ceiling or max(1, max(available, default=0) * 1.15)
+        painter.setPen(QColor('#7a9fae'))
+        painter.drawText(QRectF(100, 4, self.width() - 112, 20), Qt.AlignmentFlag.AlignLeft, self.unit)
+        painter.drawText(QRectF(12, 4, self.width() - 24, 20), Qt.AlignmentFlag.AlignRight,
+                         f'{ceiling:.0f}' if ceiling >= 10 else f'{ceiling:.1f}')
+        painter.setPen(QPen(QColor('#163744'), 1))
+        for fraction in (0, .5, 1):
+            y = plot.bottom() - plot.height() * fraction
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+        palette = ('#35d9ee', '#67dfb2')
+        for index, name in enumerate(self.series):
+            painter.setPen(QPen(QColor(palette[index % 2]), 1.8))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for segment in self.segments(index, now):
+                path = QPainterPath()
+                for offset, (stamp, value) in enumerate(segment):
+                    point = QPointF(plot.right() - (now - stamp) / self.window * plot.width(),
+                                    plot.bottom() - max(0, min(1, value / ceiling)) * plot.height())
+                    if offset == 0:
+                        path.moveTo(point)
+                    else:
+                        path.lineTo(point)
+                if len(segment) == 1:
+                    painter.drawEllipse(path.currentPosition(), 2, 2)
+                else:
+                    painter.drawPath(path)
+            painter.drawText(QRectF(12 + index * self.width() / len(self.series),
+                                   self.height() - 24, self.width() / len(self.series) - 12, 20),
+                             Qt.AlignmentFlag.AlignLeft, name)
+        painter.setPen(QColor('#7a9fae'))
+        painter.drawText(QRectF(12, plot.bottom() + 3, self.width() - 24, 18), Qt.AlignmentFlag.AlignLeft,
+                         '−' + self.range_selector.currentText())
+        painter.drawText(QRectF(12, plot.bottom() + 3, self.width() - 24, 18), Qt.AlignmentFlag.AlignRight, 'Now')
+        if not available:
+            painter.drawText(plot, Qt.AlignmentFlag.AlignCenter, 'Waiting for readings…')
+        if self.hover_x is not None:
+            painter.setPen(QPen(QColor('#d5e6ff'), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(self.hover_x, plot.top()), QPointF(self.hover_x, plot.bottom()))
+
+
+class Meter(QWidget):
+    def __init__(self, title, expanded=False, changed=None):
+        super().__init__()
+        self.setObjectName('cyberMeter')
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet('QWidget#cyberMeter {background: #091c26; border: 1px solid #1c3c4a; border-radius: 6px;} QWidget#cyberMeter:hover {border-color: #34869b;}')
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 6, 0, 6)
+        layout.setContentsMargins(8, 7, 8, 7)
         header = QHBoxLayout()
         self.header_layout = header
-        header.addWidget(QLabel(title))
+        self.toggle = QToolButton()
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setStyleSheet('QToolButton {color: #9eeafa; font-family: Consolas; background: transparent; border: none; padding: 4px 0; font-weight: 700;} QToolButton:hover {color: #ffffff;}')
+        self.toggle.setToolTip('Expand details and live history')
+        header.addWidget(self.toggle)
         self.value = QLabel('N/A')
         header.addStretch()
         header.addWidget(self.value)
@@ -716,19 +862,30 @@ class Meter(QWidget):
         layout.addWidget(self.bar)
         self.detail = QLabel('')
         self.detail.setWordWrap(True)
-        self.detail.setStyleSheet('color: #a2aec3; font-size: 11px;')
+        self.detail.setStyleSheet('color: #8faebd; font-size: 11px;')
         layout.addWidget(self.detail)
+        self.graph = HistoryGraph()
+        layout.addWidget(self.graph)
+        self.toggle.toggled.connect(lambda value: (self.set_expanded(value), changed(value) if changed else None))
+        self.set_expanded(expanded)
         self.update_value(None)
+
+    def set_expanded(self, expanded):
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.graph.setVisible(expanded)
+        self.detail.setVisible(expanded)
 
     def update_value(self, value, detail=''):
         value = number(value)
         shade = '#657086' if value is None else color(value)
         self.value.setText('N/A' if value is None else f'{value:.1f}%')
-        self.value.setStyleSheet(f'color: {shade}; font-size: 19px; font-weight: 600;')
+        self.value.setStyleSheet(f'color: {shade}; font-family: Consolas; font-size: 21px; font-weight: 700;')
         self.bar.setValue(0 if value is None else round(max(0, min(100, value)) * 10))
-        self.bar.setStyleSheet('QProgressBar {background: #293245; border: none; border-radius: 4px;}'
+        self.bar.setStyleSheet('QProgressBar {background: #102c38; border: none; border-radius: 4px;}'
                               f'QProgressBar::chunk {{background: {shade}; border-radius: 4px;}}')
         self.detail.setText(detail)
+        self.toggle.setToolTip(detail + '\nClick for details and live history')
+        self.graph.add_sample((value,))
 
 
 class DetailSection(QWidget):
@@ -741,8 +898,10 @@ class DetailSection(QWidget):
         self.toggle.setCheckable(True)
         self.toggle.setChecked(expanded)
         self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.toggle.setStyleSheet('QToolButton {color: #b9d9f5; background: #202c40; border: none;'
-                                 'border-radius: 6px; padding: 9px; font-size: 12px; text-align: left;}')
+        self.toggle.setStyleSheet('QToolButton {color: #7be8fa; background: #0a2430; border: 1px solid #1c4352;'
+                                 'border-left: 2px solid #35d9ee; border-radius: 4px; padding: 9px; font-family: Consolas; font-size: 11px; text-align: left;}'
+                                 'QToolButton:hover {background: #103442; border-color: #35d9ee;}'
+                                 'QToolButton:checked {background: #10303c; color: #d9faff;}')
         self.toggle.setSizePolicy(self.sizePolicy().horizontalPolicy(), self.sizePolicy().verticalPolicy())
         self.header_layout = QHBoxLayout()
         self.header_layout.addWidget(self.toggle, 1)
@@ -752,8 +911,9 @@ class DetailSection(QWidget):
         self.body_layout.setContentsMargins(4, 6, 4, 4)
         self.label = QLabel('Waiting for first sample…')
         self.label.setWordWrap(True)
+        self.label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self.label.setTextFormat(Qt.TextFormat.PlainText)
-        self.label.setStyleSheet('color: #b5c2d6; font-size: 12px;')
+        self.label.setStyleSheet('color: #adcbd7; font-size: 12px;')
         self.body_layout.addWidget(self.label)
         layout.addWidget(self.body)
         self.set_expanded(expanded)
@@ -777,7 +937,7 @@ class ResizeGrip(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor('#7ac2ff'), 2, Qt.PenStyle.SolidLine,
+        painter.setPen(QPen(QColor('#51e0ef'), 2, Qt.PenStyle.SolidLine,
                             Qt.PenCapStyle.RoundCap))
         for length in (4, 9, 14):
             painter.drawLine(19 - length, 19, 19, 19 - length)
@@ -892,6 +1052,42 @@ class FloatingPanel(QWidget):
         event.accept()
 
 
+def pressure_summary(readings):
+    """Describe measured pressure, without claiming to identify a slowdown's cause."""
+    notes = []
+    for key, limit, message in (
+        ('cpu', 85, 'CPU is busy. Check the highest-CPU apps below.'),
+        ('ram', 85, 'Memory use is high. Check the largest apps before opening more.'),
+        ('gpu', 95, 'GPU is busy. This can be expected in games or graphics work.'),
+        ('disk', 90, 'The selected drive is nearly full. Check its free space.')):
+        value = number(readings.get(key))
+        if value is not None and value >= limit:
+            notes.append(message)
+    if not any(number(readings.get(key)) is not None for key in ('cpu', 'ram', 'gpu', 'disk')):
+        return 'Waiting for current readings…'
+    return '\n\n'.join(notes) if notes else 'No high resource use detected in the latest sample.'
+
+
+def history_rows(graphs, now):
+    """Export actual collected samples, keeping unavailable values explicitly empty."""
+    rows = []
+    for metric, graph in graphs.items():
+        for stamp, values in graph.samples:
+            if not now - 3600 <= stamp <= now:
+                continue
+            utc = datetime.fromtimestamp(stamp + graph.clock_offset, timezone.utc).isoformat(timespec='milliseconds')
+            for series, value in zip(graph.series, values):
+                rows.append((utc, metric, series, '' if value is None else value,
+                             graph.unit, 'unavailable' if value is None else 'recorded'))
+    return sorted(rows, key=lambda row: (row[0], row[1], row[2]))
+
+
+def sensor_status(data):
+    if not data.get('hardware'):
+        return 'SENSORS UNAVAILABLE'
+    return 'SENSORS LIVE' if data.get('hardware_age', 0) <= 2 else 'SENSORS DELAYED'
+
+
 class Monitor(QWidget):
     def __init__(self):
         super().__init__()
@@ -906,18 +1102,22 @@ class Monitor(QWidget):
         self.setMinimumWidth(320)
         self.setMaximumSize(1200, 1600)
         self.drag = None
-        self.setStyleSheet('QLabel {color: #e6edf8; font-family: "Segoe UI"; font-size: 13px;}'
+        self.setStyleSheet('QLabel {color: #d9f6ff; font-family: "Segoe UI"; font-size: 13px;}'
                           'QPushButton {color: #b8c4d8; background: transparent; border: none;'
                           'font-size: 20px;} QPushButton:hover {color: #ff6577;}')
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 16, 22, 28)
         title = QHBoxLayout()
-        label = QLabel('PC MONITOR')
-        label.setStyleSheet('font-weight: 700; font-size: 16px;')
+        label = QLabel('PC // MONITOR')
+        label.setStyleSheet('color: #70efff; font-family: Consolas; font-weight: 700; font-size: 16px;')
         title.addWidget(label)
         title.addStretch()
+        self.view_button = QPushButton('Widget view')
+        self.view_button.setStyleSheet('font-size: 12px; color: #70efff; padding: 5px;')
+        self.view_button.clicked.connect(self.toggle_dashboard)
+        title.addWidget(self.view_button)
         settings = QPushButton('Settings')
-        settings.setStyleSheet('font-size: 12px; padding: 5px; color: #7ac2ff;')
+        settings.setStyleSheet('font-size: 12px; padding: 5px; color: #51e0ef;')
         settings.setToolTip('Appearance and monitoring settings')
         settings.clicked.connect(self.open_settings)
         title.addWidget(settings)
@@ -927,13 +1127,45 @@ class Monitor(QWidget):
         close.clicked.connect(self.close)
         title.addWidget(close)
         layout.addLayout(title)
+        self.diagnostic_dialog = None
+        self.current_readings = {}
+        self.current_sensor_data = {}
+        self.inspect_button = QPushButton('What’s slowing my PC?  ↗')
+        self.inspect_button.setStyleSheet('QPushButton {font-family: Consolas; font-size: 12px; color: #70efff; padding: 10px; background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #0d3442,stop:1 #0a1c29); border: 1px solid #32879b; border-radius: 4px;} QPushButton:hover {background: #164555; color: white; border-color: #70efff;}')
+        self.inspect_button.clicked.connect(self.open_diagnostics)
+        layout.addWidget(self.inspect_button)
+        self.dashboard_toolbar = QWidget()
+        tools = QHBoxLayout(self.dashboard_toolbar)
+        tools.setContentsMargins(0, 2, 0, 2)
+        self.overview = QLabel('Waiting for readings…')
+        self.overview.setStyleSheet('color: #9cc6d4; font-family: Consolas; font-size: 11px;')
+        self.overview.setWordWrap(True)
+        tools.addWidget(self.overview, 1)
+        range_label = QLabel('ALL GRAPHS')
+        range_label.setStyleSheet('color: #75abba; font-family: Consolas; font-size: 10px;')
+        tools.addWidget(range_label)
+        self.global_range = QComboBox()
+        self.global_range.setAccessibleName('Time range for all graphs')
+        self.global_range.setPlaceholderText('Mixed')
+        self.global_range.setStyleSheet('QComboBox {color: #b9f4ff; background: #0a2430; padding: 5px; border: 1px solid #24566a;} QComboBox QAbstractItemView {background: #0a2430; color: #d9f6ff;}')
+        for text, seconds in [('5 min', 300), ('30 min', 1800), ('1 hour', 3600)]:
+            self.global_range.addItem(text, seconds)
+        self.global_range.setCurrentIndex(0)
+        self.global_range.currentIndexChanged.connect(self.set_all_graph_ranges)
+        tools.addWidget(self.global_range)
+        export = QPushButton('Export CSV')
+        export.setStyleSheet('QPushButton {font-size: 12px; color: #70efff; background: #0a2430; border: 1px solid #24566a; padding: 6px 10px; border-radius: 4px;} QPushButton:hover {background: #164555;}')
+        export.setToolTip('Save up to one hour of collected readings. Includes missing values; no process list is exported.')
+        export.clicked.connect(self.export_history)
+        tools.addWidget(export)
+        layout.addWidget(self.dashboard_toolbar)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget {background: transparent;}'
-                                 'QScrollBar:vertical {background: #172233; width: 7px; border-radius: 3px;}'
-                                 'QScrollBar::handle:vertical {background: #4d6a8a; min-height: 25px; border-radius: 3px;}'
+                                 'QScrollBar:vertical {background: #06131c; width: 7px; border-radius: 3px;}'
+                                 'QScrollBar::handle:vertical {background: #246477; min-height: 25px; border-radius: 3px;}'
                                  'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical {height: 0px;}')
         content = ReorderList(self)
         content_layout = QVBoxLayout(content)
@@ -943,7 +1175,8 @@ class Monitor(QWidget):
         layout.addWidget(self.scroll, 1)
         self.meters = {}
         for key, text in [('cpu', 'CPU'), ('ram', 'RAM'), ('disk', 'DISK SPACE'), ('gpu', 'GPU')]:
-            meter = Meter(text)
+            meter = Meter(text, self.options['history_' + key],
+                          lambda value, name=key: self.save_history(name, value))
             self.meters[key] = meter
             content_layout.addWidget(meter)
         self.sections = {}
@@ -959,6 +1192,11 @@ class Monitor(QWidget):
             self.sections[key] = section
             content_layout.addWidget(section)
         self.core_meters = []
+        self.network_graph = HistoryGraph(('Download', 'Upload'), 'Mbps', ceiling=None)
+        self.network_history_adapter = None
+        self.sections['network'].body_layout.addWidget(self.network_graph)
+        for graph in self.history_graphs().values():
+            graph.range_selector.currentIndexChanged.connect(self.sync_global_range)
         self.core_grid = QFormLayout()
         self.sections['cores'].body_layout.addLayout(self.core_grid)
         content_layout.addStretch()
@@ -967,17 +1205,48 @@ class Monitor(QWidget):
             handle = RowDragHandle(self, key)
             widget.header_layout.insertWidget(0, handle)
             self.row_handles[key] = handle
+        self.dashboard = QWidget()
+        dashboard_layout = QHBoxLayout(self.dashboard)
+        dashboard_layout.setContentsMargins(0, 0, 0, 0)
+        dashboard_layout.setSpacing(18)
+        self.dashboard_grid = QGridLayout()
+        self.dashboard_grid.setSpacing(12)
+        self.dashboard_grid.setColumnStretch(0, 1)
+        self.dashboard_grid.setColumnStretch(1, 1)
+        main_cards = QWidget()
+        main_cards.setLayout(self.dashboard_grid)
+        main_scroll = QScrollArea()
+        main_scroll.setWidgetResizable(True)
+        main_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        main_scroll.setStyleSheet(self.scroll.styleSheet())
+        main_scroll.setWidget(main_cards)
+        self.sidebar_layout = QVBoxLayout()
+        self.sidebar_layout.setSpacing(12)
+        self.sidebar_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        sidebar = QWidget()
+        sidebar.setLayout(self.sidebar_layout)
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        side_scroll.setStyleSheet(self.scroll.styleSheet())
+        side_scroll.setWidget(sidebar)
+        side_scroll.setMinimumWidth(270)
+        side_scroll.setMaximumWidth(340)
+        dashboard_layout.addWidget(main_scroll, 2)
+        dashboard_layout.addWidget(side_scroll, 1)
+        layout.addWidget(self.dashboard, 1)
         self.panel_controls = QWidget()
         controls_layout = QVBoxLayout(self.panel_controls)
         controls_layout.setContentsMargins(0, 4, 0, 4)
         help_text = QLabel('Drag each panel by its title.\nChoose panels in Settings → Monitoring.')
-        help_text.setStyleSheet('color: #a2aec3; font-size: 12px;')
+        help_text.setStyleSheet('color: #8faebd; font-size: 12px;')
         controls_layout.addWidget(help_text)
         buttons = QHBoxLayout()
         arrange = QPushButton('Arrange panels')
         together = QPushButton('Keep together')
         for button in (arrange, together):
-            button.setStyleSheet('font-size: 12px; color: #7ac2ff; padding: 6px; background: #202c40; border-radius: 5px;')
+            button.setStyleSheet('font-size: 12px; color: #51e0ef; padding: 6px; background: #0a2430; border-radius: 5px;')
             buttons.addWidget(button)
         arrange.clicked.connect(self.arrange_panels)
         together.clicked.connect(self.dock_panels)
@@ -987,7 +1256,7 @@ class Monitor(QWidget):
         self.network_sampler = NetworkSampler()
         self.counter_time = time.monotonic()
         self.status = QLabel('Starting sensors…  •  Drag to move')
-        self.status.setStyleSheet('color: #8290a8; font-size: 11px;')
+        self.status.setStyleSheet('color: #79a7b7; font-family: Consolas; font-size: 10px; padding-top: 6px; border-top: 1px solid #1b3c49;')
         layout.addWidget(self.status)
         self.grip = ResizeGrip(self)
         self.grip.raise_()
@@ -1006,10 +1275,131 @@ class Monitor(QWidget):
             if not any(screen.availableGeometry().intersects(self.frameGeometry())
                        for screen in QApplication.screens()):
                 self.move(QApplication.primaryScreen().availableGeometry().topLeft())
+        if self.options['dashboard']:
+            self.keep_dashboard_on_screen()
+
+    def keep_dashboard_on_screen(self):
+        area = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        self.move(max(area.left(), min(self.x(), area.right() - self.width() + 1)),
+                  max(area.top(), min(self.y(), area.bottom() - self.height() + 1)))
+
+    def toggle_dashboard(self):
+        self.save_settings()
+        self.options['dashboard'] = not self.options['dashboard']
+        self.apply_settings()
+        self.keep_dashboard_on_screen()
+        self.save_settings()
+
+    def history_graphs(self):
+        return {**{key: meter.graph for key, meter in self.meters.items()}, 'network': self.network_graph}
+
+    def set_all_graph_ranges(self, index):
+        if index < 0:
+            return
+        for graph in self.history_graphs().values():
+            graph.range_selector.setCurrentIndex(index)
+
+    def sync_global_range(self, _index):
+        ranges = {graph.range_selector.currentIndex() for graph in self.history_graphs().values()}
+        self.global_range.blockSignals(True)
+        self.global_range.setCurrentIndex(next(iter(ranges)) if len(ranges) == 1 else -1)
+        self.global_range.blockSignals(False)
+
+    def export_history(self):
+        rows = history_rows(self.history_graphs(), time.monotonic())
+        if not any(row[-1] == 'recorded' for row in rows):
+            QMessageBox.information(self, 'Export readings', 'Wait for readings to collect before exporting.')
+            return
+        filename, _ = QFileDialog.getSaveFileName(self, 'Save recorded readings',
+                                                 str(ROOT / 'PC Monitor readings.csv'), 'CSV files (*.csv)')
+        if not filename:
+            return
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8-sig') as target:
+                writer = csv.writer(target)
+                writer.writerow(('timestamp_utc', 'metric', 'series', 'value', 'unit', 'status'))
+                writer.writerows(rows)
+        except OSError as error:
+            QMessageBox.warning(self, 'Export readings', 'Could not save the file: ' + str(error))
+            return
+        QMessageBox.information(self, 'Readings saved', f'Saved {len(rows):,} readings. Times are UTC; history covers only samples collected during this run.')
+
+    def save_history(self, name, value):
+        self.options['history_' + name] = value
+        self.save_settings()
+
+    def open_diagnostics(self):
+        if self.diagnostic_dialog is not None:
+            self.diagnostic_dialog.show()
+            self.diagnostic_dialog.raise_()
+            self.diagnostic_dialog.activateWindow()
+            return
+        dialog = QDialog(self)
+        self.diagnostic_dialog = dialog
+        dialog.setWindowTitle('PC Monitor · Resource check')
+        dialog.resize(480, 560)
+        dialog.setMinimumWidth(360)
+        dialog.setStyleSheet('QDialog {background: #07151e;} QLabel {color: #d9f6ff; font-size: 13px;} QPushButton {font-size: 13px; color: #70efff; padding: 8px;}')
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        heading = QLabel('WHAT’S USING YOUR PC?')
+        heading.setStyleSheet('font-size: 17px; font-weight: 700;')
+        layout.addWidget(heading)
+        hint = QLabel('Live readings show resource use, not proof of what caused a slowdown. High use can be normal during demanding work.')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('color: #8faebd; font-size: 12px;')
+        layout.addWidget(hint)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        body = QVBoxLayout(content)
+        scroll.setWidget(content)
+        scroll.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget {background: transparent;}')
+        layout.addWidget(scroll, 1)
+        fields = []
+        for title in ('CURRENT READINGS', 'RESOURCE PRESSURE', 'HIGHEST CPU · TOTAL CAPACITY', 'LARGEST APPS · WORKING SET'):
+            label = QLabel(title)
+            label.setStyleSheet('color: #51e0ef; font-size: 11px; font-weight: 600; margin-top: 10px;')
+            body.addWidget(label)
+            field = QLabel()
+            field.setWordWrap(True)
+            field.setTextFormat(Qt.TextFormat.PlainText)
+            field.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            body.addWidget(field)
+            fields.append(field)
+        body.addStretch()
+        footer = QLabel('Disk space is capacity, not disk busy time. GPU may be unavailable without its sensor provider. Protected apps may be missing. Updates follow your refresh setting.')
+        footer.setWordWrap(True)
+        footer.setStyleSheet('color: #8faebd; font-size: 11px;')
+        layout.addWidget(footer)
+        close = QPushButton('Close')
+        close.clicked.connect(dialog.close)
+        layout.addWidget(close)
+
+        def refresh_report():
+            readings, data = self.current_readings, self.current_sensor_data
+            fields[0].setText('   ·   '.join(
+                name + ' ' + ('N/A' if number(readings.get(key)) is None else f'{readings[key]:.1f}%')
+                for key, name in [('cpu', 'CPU'), ('ram', 'RAM'), ('gpu', 'GPU'), ('disk', 'Disk space')]))
+            fields[1].setText(pressure_summary(readings))
+            fields[2].setText('\n'.join(f"{row['name']} — {row['cpu']:.1f}%" for row in data.get('top_cpu', []))
+                              or 'Waiting for process samples…')
+            fields[3].setText('\n'.join(f"{row['name']} — {row['ram'] / 2**20:.0f} MiB" for row in data.get('top_ram', []))
+                              or 'Waiting for process samples…')
+
+        timer = QTimer(dialog)
+        timer.timeout.connect(refresh_report)
+        timer.start(1000)
+        refresh_report()
+        dialog.finished.connect(lambda result: (timer.stop(), setattr(self, 'diagnostic_dialog', None), dialog.deleteLater()))
+        dialog.show()
 
     def save_settings(self):
         self.options.update(x=self.x(), y=self.y())
-        if not self.options['separate_panels']:
+        if self.options['dashboard']:
+            self.options.update(dashboard_width=self.width(), dashboard_height=self.height())
+        elif not self.options['separate_panels']:
             self.options.update(width=self.width(), height=self.height())
         try:
             temporary = CONFIG.with_suffix('.tmp')
@@ -1027,8 +1417,17 @@ class Monitor(QWidget):
 
     def apply_order(self):
         widgets = self.panel_widgets()
+        if self.options['dashboard']:
+            for index, key in enumerate(('cpu', 'gpu', 'ram', 'disk')):
+                self.dashboard_grid.addWidget(widgets[key], index // 2, index % 2)
+            self.dashboard_grid.addWidget(widgets['network'], 2, 0, 1, 2)
+            self.dashboard_grid.addWidget(widgets['activity'], 3, 0, 1, 2)
+            for key in ('apps', 'hardware', 'cores', 'graphics', 'battery'):
+                self.sidebar_layout.addWidget(widgets[key])
+            self.sidebar_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+            self.dashboard_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+            return
         for index, key in enumerate(self.options['monitor_order']):
-            self.content_layout.removeWidget(widgets[key])
             self.content_layout.insertWidget(index, widgets[key])
 
     def move_monitor(self, key, before=None):
@@ -1121,15 +1520,52 @@ class Monitor(QWidget):
         self.drive = self.options['drive'] or self.drive
         self.sync_panels()
         self.apply_order()
+        dashboard = self.options['dashboard']
+        self.dashboard_toolbar.setVisible(dashboard)
+        self.view_button.setText('Widget view' if dashboard else 'Dashboard')
+        self.view_button.setToolTip('Switch between the dashboard and compact widget')
+        self.dashboard.setVisible(dashboard)
+        self.scroll.setVisible(not dashboard)
+        for handle in self.row_handles.values():
+            handle.setVisible(not dashboard)
         for key, meter in self.meters.items():
             meter.setVisible(self.options['show_' + key])
-            meter.detail.setVisible(not self.options['compact'])
+            meter.graph.setFixedHeight(105 if dashboard else 155)
+            if dashboard and not getattr(self, 'dashboard_applied', False):
+                meter.toggle.blockSignals(True)
+                meter.toggle.setChecked(True)
+                meter.toggle.blockSignals(False)
+            elif not dashboard:
+                meter.toggle.blockSignals(True)
+                meter.toggle.setChecked(self.options['history_' + key])
+                meter.toggle.blockSignals(False)
+            meter.set_expanded(meter.toggle.isChecked())
+            meter.detail.setVisible(meter.toggle.isChecked() and not self.options['compact'])
         for key, section in self.sections.items():
             section.setVisible(self.options['show_' + key])
+            if dashboard and not getattr(self, 'dashboard_applied', False):
+                expanded = key in ('network', 'apps', 'hardware')
+                section.toggle.blockSignals(True)
+                section.toggle.setChecked(expanded)
+                section.toggle.blockSignals(False)
+                section.set_expanded(expanded)
+            elif not dashboard:
+                option = {'cores': 'cpu', 'graphics': 'gpu'}.get(key, key)
+                expanded = self.options['expand_' + option]
+                section.toggle.blockSignals(True)
+                section.toggle.setChecked(expanded)
+                section.toggle.blockSignals(False)
+                section.set_expanded(expanded)
+        self.network_graph.setFixedHeight(105 if dashboard else 155)
+        self.dashboard_applied = dashboard
+        self.setMinimumWidth(900 if dashboard else 320)
         self.layout().activate()
         minimum = self.minimumSizeHint()
-        self.resize(max(self.options['width'], minimum.width()),
-                    max(190 if self.options['separate_panels'] else (self.options['height'] or 600),
+        area = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        width = min(self.options['dashboard_width'], area.width()) if dashboard else self.options['width']
+        height = min(self.options['dashboard_height'], area.height()) if dashboard else (self.options['height'] or 600)
+        self.resize(max(width, minimum.width()),
+                    max(190 if self.options['separate_panels'] else height,
                         minimum.height()))
         self.update()
         if visible:
@@ -1146,7 +1582,9 @@ class Monitor(QWidget):
 
     def refresh(self, first=False):
         data = self.sensors.snapshot()
-        self.meters['cpu'].update_value(None if first else psutil.cpu_percent(None),
+        cpu_usage = None if first else psutil.cpu_percent(None)
+        disk_usage = None
+        self.meters['cpu'].update_value(cpu_usage,
                                         ('Temperature: ' + fahrenheit(data.get('cpu_temp'))
                                          + (' (last reading)' if data.get('cpu_temp_age', 0) > 2 else ''))
                                         if self.options['temperatures'] else 'Live processor usage')
@@ -1154,6 +1592,7 @@ class Monitor(QWidget):
         self.meters['ram'].update_value(mem.percent, f'{mem.used / 2**30:.1f} / {mem.total / 2**30:.1f} GB used')
         try:
             disk = psutil.disk_usage(self.drive)
+            disk_usage = disk.percent
             self.meters['disk'].update_value(disk.percent,
                 f'{self.drive}  ·  {disk.used / 2**30:.1f} / {disk.total / 2**30:.1f} GB used')
         except OSError:
@@ -1169,12 +1608,24 @@ class Monitor(QWidget):
                                      'Brief sensor gaps retain the last reading for up to 5 seconds.')
         state = 'Position locked' if self.options['locked'] else 'Drag to move'
         self.status.setText(f"LIVE  ·  {self.options['refresh']}s refresh  ·  {state}")
+        self.current_readings = dict(cpu=cpu_usage, ram=mem.percent, disk=disk_usage,
+                                     gpu=data.get('gpu') if data.get('gpu_age', 0) <= 2 else None)
+        self.current_sensor_data = data
+        pressure = 'MEMORY HIGH' if mem.percent >= 85 else 'CPU BUSY' if cpu_usage is not None and cpu_usage >= 85 else 'MONITORING'
+        self.overview.setText(pressure + '  /  ' + sensor_status(data))
+        self.overview.setToolTip(pressure_summary(self.current_readings) + '\nSensor status refers to the external hardware sensor provider.')
         self.refresh_details(data, first)
 
     def refresh_details(self, data, first=False):
         now = time.monotonic()
         counters = {}
         network = self.network_sampler.sample(self.options['network_adapter'])
+        if network['adapter'] != self.network_history_adapter:
+            self.network_graph.samples.clear()
+            self.network_history_adapter = network['adapter']
+        self.network_graph.add_sample(tuple(
+            None if network[key] is None else network[key] * 8 / 1_000_000
+            for key in ('download', 'upload')))
         try:
             disk = psutil.disk_io_counters()
             if disk:
@@ -1272,10 +1723,17 @@ class Monitor(QWidget):
                 value = fahrenheit(sensor['value'])
             else:
                 continue
-            hardware_lines.append(f"{sensor['device']} · {sensor['name']}: {value}")
+            name = sensor['name']
+            if sensor['kind'] == 'temperature':
+                name = {'warning temperature': 'Warning limit (reference)',
+                        'critical temperature': 'Critical limit (reference)'}.get(name.lower(), name)
+            hardware_lines.append(f"{sensor['device']} · {name}: {value}")
         if not hardware_lines:
             hardware_lines = ['Fans and temperature sensors: N/A\nLibre Hardware Monitor supplies supported sensors.']
         self.sections['hardware'].label.setText('\n'.join(hardware_lines))
+        self.sections['hardware'].label.setToolTip(
+            'Warning and critical limits are device-reported thresholds, not active alerts.\n'
+            'Composite Temperature and other temperature sensors show current readings.')
 
         app_lines = ['MOST CPU · share of total processor capacity']
         cpu_rows = data.get('top_cpu', [])
@@ -1290,13 +1748,32 @@ class Monitor(QWidget):
         else:
             app_lines.append('N/A · waiting for process samples')
         self.sections['apps'].label.setText('\n'.join(app_lines))
+        # Wrapped sensor/process text must grow its scroll content instead of
+        # being squeezed to a one-line minimum by the dashboard's side column.
+        for section in self.sections.values():
+            label = section.label
+            label.setMinimumHeight(max(0, label.heightForWidth(max(1, label.width()))))
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setBrush(QColor(16, 22, 34, round(self.options['opacity'] * 2.55)))
-        painter.setPen(QPen(QColor(115, 139, 176, 100), 1))
-        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 20, 20)
+        background = QLinearGradient(0, 0, self.width(), self.height())
+        alpha = round(self.options['opacity'] * 2.55)
+        background.setColorAt(0, QColor(5, 21, 30, alpha))
+        background.setColorAt(1, QColor(4, 11, 20, alpha))
+        painter.setBrush(background)
+        painter.setPen(QPen(QColor('#245365'), 1))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 10, 10)
+        painter.setPen(QPen(QColor(44, 151, 177, 15), 1))
+        for x in range(16, self.width() - 8, 24):
+            painter.drawLine(x, 48, x, self.height() - 26)
+        for y in range(48, self.height() - 20, 24):
+            painter.drawLine(9, y, self.width() - 9, y)
+        painter.setPen(QPen(QColor('#35d9ee'), 2))
+        for x, y, dx, dy in [(9, 9, 1, 1), (self.width()-9, 9, -1, 1),
+                             (9, self.height()-9, 1, -1), (self.width()-9, self.height()-9, -1, -1)]:
+            painter.drawLine(x, y, x + dx * 16, y)
+            painter.drawLine(x, y, x, y + dy * 16)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

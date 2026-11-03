@@ -16,6 +16,7 @@ pc_monitor_cameras.*
 *.log
 *.bak
 *.tmp
+PC Monitor readings*.csv
 
 # Build products and local shortcuts
 *.exe
