@@ -17,6 +17,41 @@ spec.loader.exec_module(m)
 
 
 class Readings(unittest.TestCase):
+    def test_live_sensors_keep_labels_but_not_stale_readings(self):
+        known = {}
+        sensor = dict(id='/nvme/0/temperature/0', device='SSD', name='Composite', kind='temperature', value=40)
+        limit = dict(sensor, id='limit', name='Critical Temperature', value=85)
+        fresh = m.live_sensor_lines(dict(hardware=[sensor, limit], cpu_temp=50), known)
+        self.assertIn('SSD · Composite: 104.0 °F', fresh)
+        self.assertFalse(any('Critical' in line for line in fresh))
+        stale = m.live_sensor_lines(dict(hardware=[sensor], hardware_age=3, cpu_temp=50, cpu_temp_age=3), known)
+        self.assertIn('SSD · Composite: N/A', stale)
+        self.assertIn('CPU temperature: N/A', stale)
+        self.assertIn('SSD · Composite: N/A', m.live_sensor_lines({}, known))
+
+    def test_alerts_require_sustained_fresh_values_and_rearm(self):
+        alerts = m.extras.SustainedAlerts()
+        options = dict(m.DEFAULTS, alerts_enabled=True, alert_seconds=5)
+        self.assertEqual(alerts.update({'cpu': 95}, options, now=0), [])
+        self.assertEqual(alerts.update({'cpu': None}, options, now=5), [])
+        self.assertEqual(alerts.update({'cpu': 95}, options, now=6), [])
+        self.assertEqual(len(alerts.update({'cpu': 95}, options, now=11)), 1)
+        self.assertEqual(alerts.update({'cpu': 99}, options, now=12), [])
+        alerts.update({'cpu': 20}, options, now=13)
+        self.assertFalse(alerts.active)
+        self.assertEqual(alerts.update({'cpu': 95}, options, now=400), [])
+        self.assertEqual(len(alerts.update({'cpu': 95}, options, now=405)), 1)
+        alerts.update({}, dict(options, alerts_enabled=False), now=406)
+        self.assertFalse(alerts.active)
+
+    def test_network_quality_loss_zero_ping_and_jitter_gaps(self):
+        result = m.extras.ping_summary([0, 10, None, 30])
+        self.assertAlmostEqual(result['ping'], 40 / 3)
+        self.assertEqual(result['loss'], 25)
+        self.assertEqual(result['jitter'], 10)
+        self.assertIsNone(m.extras.ping_summary([None] * 10)['ping'])
+        self.assertEqual(m.extras.ping_summary([None] * 10)['loss'], 100)
+
     def test_thresholds_and_units(self):
         self.assertEqual([m.color(x) for x in (49.9, 50, 79.9, 80)],
                          ['#45aaff', '#ffd166', '#ffd166', '#ff6577'])
@@ -89,6 +124,51 @@ class FakeSensors:
 
 
 class Widget(unittest.TestCase):
+    def test_floating_panels_round_trip_and_persist(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(m, 'CONFIG', Path(directory) / 'settings.json'), \
+             patch.object(m, 'Sensors', FakeSensors):
+            widget = m.Monitor()
+            try:
+                widget.float_panels()
+                self.assertTrue(widget.options['separate_panels'])
+                self.assertIs(widget.panels['cpu'].scroll.widget(), widget.meters['cpu'])
+                widget.panels['cpu'].move(30, 40)
+                widget.panels['cpu'].save_settings()
+                self.assertTrue(m.load_settings()['floating_enabled'])
+                self.assertEqual(m.load_settings()['panel_positions']['cpu']['x'], 30)
+                widget.dock_panels()
+                self.assertFalse(widget.panels)
+                self.assertIs(widget.dashboard_grid.itemAtPosition(0, 0).widget(), widget.meters['cpu'])
+                self.assertFalse(m.load_settings()['floating_enabled'])
+            finally:
+                widget.close()
+
+    def test_network_speed_rejects_partial_download_and_can_cancel(self):
+        graph = m.HistoryGraph()
+        panel = m.extras.NetworkQuality(NS(network_graph=graph))
+        try:
+            panel.phase = 'download'
+            panel.started = m.time.monotonic() - 1
+            panel.set_busy(True)
+            panel.reply = NS(readAll=lambda: b'partial',
+                error=lambda: m.extras.QNetworkReply.NetworkError.NoError,
+                errorString=lambda: '', deleteLater=lambda: None)
+            panel.finish_transfer()
+            self.assertIn('Incomplete download', panel.speed_result.text())
+            self.assertTrue(panel.speed.isEnabled())
+            aborted = []
+            panel.reply = NS(abort=lambda: aborted.append(True), deleteLater=lambda: None)
+            panel.set_busy(True)
+            panel.cancel()
+            self.assertEqual(aborted, [True])
+            self.assertIsNone(panel.reply)
+            self.assertTrue(panel.speed.isEnabled())
+        finally:
+            panel.shutdown()
+            panel.close()
+            graph.close()
+
     @classmethod
     def setUpClass(cls):
         cls.app = m.QApplication.instance() or m.QApplication([])
@@ -187,7 +267,7 @@ class Widget(unittest.TestCase):
                 self.assertTrue(widget.meters['gpu'].isHidden())
                 dialog = m.SettingsDialog(widget)
                 tabs = dialog.findChild(m.QTabWidget)
-                self.assertEqual([tabs.tabText(i) for i in range(tabs.count())], ['Appearance', 'Monitoring'])
+                self.assertEqual([tabs.tabText(i) for i in range(tabs.count())], ['Appearance', 'Monitoring', 'Theme', 'Alerts'])
                 dialog.close()
             finally:
                 widget.close()
@@ -258,6 +338,164 @@ class Widget(unittest.TestCase):
         self.assertEqual(rows[0][-1], 'unavailable')
         self.assertEqual(rows[1][3], 30)
         graph.close()
+
+    def test_rendered_test_frames_measure_and_stop(self):
+        reader = m.extras.FpsReader(None)
+        reader.start_test()
+        for stamp in (10, 10.02, 10.04):
+            reader.record_test_frame(stamp)
+        self.assertAlmostEqual(reader.samples.fps(now=10.04), 50)
+        self.assertIsNone(reader.samples.fps(now=14))
+        reader.stop()
+        reader.record_test_frame(14.02)
+        self.assertEqual(len(reader.samples.frames), 0)
+
+    def test_frame_samples_separate_swap_chains_and_expire(self):
+        frames = m.extras.FrameSamples()
+        for stamp in (10, 10.1, 10.2):
+            frames.add(dict(MsBetweenPresents='16.6666667', SwapChainAddress='main'), now=stamp)
+        frames.add(dict(MsBetweenPresents='100', SwapChainAddress='secondary'), now=10.2)
+        frames.add(dict(MsBetweenPresents='0', SwapChainAddress='main'), now=10.3)
+        frames.add(dict(MsBetweenPresents='nan', SwapChainAddress='main'), now=10.3)
+        self.assertAlmostEqual(frames.fps(now=11), 60, places=4)
+        frames.add(dict(MsBetweenPresents='16.6666667', SwapChainAddress='main', Dropped='1'), now=10.3)
+        self.assertEqual(len(frames.frames), 5)
+        self.assertAlmostEqual(frames.fps(now=11), 60, places=4)
+        self.assertIsNone(frames.fps(now=14))
+
+    def test_one_percent_low_uses_slowest_frames_and_expires(self):
+        frames = m.extras.FrameSamples()
+        for index in range(100):
+            frames.add({'msbetweenpresents': 50 if index == 99 else 10}, now=10 + index / 100)
+        self.assertAlmostEqual(frames.low_fps(now=11), 20)
+        self.assertIsNone(frames.low_fps(now=40))
+
+    def test_dashboard_customization_and_overlay_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(m, 'CONFIG', Path(directory) / 'settings.json'), \
+             patch.object(m, 'Sensors', FakeSensors):
+            widget = m.Monitor()
+            widget.show()
+            try:
+                widget.move_monitor('gpu', 'cpu')
+                self.assertIs(widget.dashboard_grid.itemAtPosition(0, 0).widget(), widget.meters['gpu'])
+                widget.options.update(accent='Violet', text_size=15, card_heights={'cpu': 175})
+                widget.apply_settings()
+                self.assertEqual(widget.meters['cpu'].graph.height(), 175)
+                widget.options['card_spans']['gpu'] = 2
+                widget.apply_order()
+                self.assertIs(widget.dashboard_grid.itemAtPosition(0, 1).widget(), widget.meters['gpu'])
+                self.assertIs(widget.dashboard_grid.itemAtPosition(1, 0).widget(), widget.meters['cpu'])
+                style = widget.inspect_button.styleSheet()
+                m.extras.apply_theme(widget)
+                self.assertEqual(widget.inspect_button.styleSheet(), style)
+                self.assertIn('#bb91ff', style)
+                self.assertIn('font-size: 14px', style)
+                widget.show_overlay()
+                overlay = widget.overlay_window
+                self.assertIn('FPS N/A', overlay.readings.text())
+                overlay.close()
+                widget.show_overlay()
+                self.assertIsNot(widget.overlay_window, overlay)
+                widget.save_settings()
+                saved = m.load_settings()
+                self.assertEqual(saved['dashboard_order'][0], 'gpu')
+                self.assertEqual(saved['card_heights']['cpu'], 175)
+                self.assertEqual(saved['card_spans']['gpu'], 2)
+                self.assertEqual(saved['accent'], 'Violet')
+                widget.meters['cpu'].dial.grab()
+            finally:
+                widget.close()
+
+    def test_presentmon_command_targets_one_process_and_stops(self):
+        reader = m.extras.FpsReader(None)
+        with patch.object(reader.process, 'start'):
+            reader.start('PresentMon.exe', 1234, 'game.exe')
+        args = reader.process.arguments()
+        self.assertEqual(args[args.index('--process_id') + 1], '1234')
+        self.assertIn('--v1_metrics', args)
+        self.assertNotIn('--restart_as_admin', args)
+        reader.stop()
+        self.assertIsNone(reader.samples.fps())
+
+    def test_presentmon_csv_handles_case_chunks_and_target_pid(self):
+        reader = m.extras.FpsReader(None)
+        reader.pid = 1234
+        with patch.object(m.extras.time, 'monotonic', return_value=10):
+            reader.consume('Application,ProcessID,SwapChainAddress,TimeInSeconds,msBetween')
+            reader.consume('Presents,Dropped\nother.exe,4321,0x1,1,1,0\ngame.exe,1234,0x1,1,16.6666667,0\n')
+            reader.consume('game.exe,1234,0x1,2,16.6666667,0\n')
+        self.assertEqual(len(reader.samples.frames), 2)
+        self.assertAlmostEqual(reader.samples.fps(now=10), 60, places=4)
+        self.assertIsNone(reader.samples.fps(now=14))
+        reader.stop()
+
+    def test_presentmon_permission_error_is_actionable_and_stop_clears_it(self):
+        reader = m.extras.FpsReader(None)
+        with patch.object(reader.process, 'readAllStandardError', return_value=b'error: failed to start trace session: access denied.'):
+            reader.read_error()
+            reader.finished(1, m.extras.QProcess.ExitStatus.NormalExit)
+        self.assertTrue(reader.permission_denied)
+        self.assertIn('Restart with Windows approval', reader.message())
+        reader.stop()
+        self.assertFalse(reader.permission_denied)
+        self.assertEqual(reader.message(), 'FPS capture stopped.')
+
+    def test_fps_diagnostics_are_local_and_include_parser_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            holder = m.QWidget()
+            holder.root = Path(directory)
+            reader = m.extras.FpsReader(holder)
+            reader.pid = 123
+            reader.consume('Application,ProcessID,msBetweenPresents\ngame.exe,123,16.7\n')
+            reader.write_diagnostics()
+            report = json.loads((Path(directory) / 'pc_monitor_fps_status.json').read_text(encoding='utf-8'))
+            self.assertEqual(report['target_rows'], 1)
+            self.assertEqual(report['header'], ['application', 'processid', 'msbetweenpresents'])
+            self.assertFalse(report['process_running'])
+            self.assertEqual(report['buffered_frames'], 1)
+            reader.stop()
+            holder.close()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows approval flow')
+    def test_declining_fps_restart_keeps_normal_app_open(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(m, 'CONFIG', Path(directory) / 'settings.json'), \
+             patch.object(m, 'Sensors', FakeSensors):
+            widget = m.Monitor()
+            widget.show()
+            try:
+                with patch.object(m.extras.ctypes.windll.shell32, 'IsUserAnAdmin', return_value=0), \
+                     patch.object(m.QMessageBox, 'question', return_value=m.QMessageBox.StandardButton.No), \
+                     patch.object(m.extras.ctypes.windll.shell32, 'ShellExecuteW') as execute:
+                    m.extras.restart_with_windows_approval(widget)
+                execute.assert_not_called()
+                self.assertTrue(widget.isVisible())
+            finally:
+                widget.close()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows media controls')
+    def test_media_buttons_send_only_expected_media_keys(self):
+        with patch.object(m.extras.ctypes.windll.user32, 'keybd_event') as send:
+            m.extras.media_key('mute')
+            self.assertEqual(send.call_args_list[0].args, (0xAD, 0, 0, 0))
+            self.assertEqual(send.call_args_list[1].args, (0xAD, 0, 2, 0))
+        with self.assertRaises(OSError):
+            m.extras.media_key('unsupported')
+
+    def test_customization_migration_validates_saved_values(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(m, 'CONFIG', Path(directory) / 'settings.json'):
+            m.CONFIG.write_text(json.dumps(dict(accent='invalid', glow=999, text_size=900,
+                dashboard_order=['gpu', 'gpu', 'invalid'], card_spans={'cpu': 2, 'gpu': -1},
+                card_heights={'cpu': 900, 'ram': 'invalid'}, favorite_apps=['app.exe', 42, 'note.txt'])), encoding='utf-8')
+            saved = m.load_settings()
+            self.assertEqual(saved['accent'], 'Cyan')
+            self.assertEqual(saved['glow'], 100)
+            self.assertEqual(saved['text_size'], 16)
+            self.assertEqual(saved['dashboard_order'], ['gpu', 'cpu', 'ram', 'disk'])
+            self.assertEqual(saved['card_spans'], {'cpu': 2})
+            self.assertEqual(saved['card_heights'], {'cpu': 300})
+            self.assertEqual(saved['favorite_apps'], ['app.exe'])
 
 
 if __name__ == '__main__':

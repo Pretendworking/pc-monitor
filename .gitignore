@@ -9,6 +9,7 @@ __pycache__/
 pc_monitor_settings.json
 pc_monitor_settings.tmp
 pc_monitor.lock
+pc_monitor_fps_status.json
 pc_monitor_cameras.*
 .env
 .env.*

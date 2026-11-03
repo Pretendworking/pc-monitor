@@ -5,6 +5,11 @@ A standalone PySide6 desktop widget for Windows. It shows live computer readings
 ## Features
 
 - Cyber-tech dashboard with CPU/GPU/RAM/disk cards, a network graph, and a separate apps/sensors column. **Widget view** returns to the narrow reorderable list; both window sizes are remembered.
+- CPU/GPU circular gauges show usage and Fahrenheit temperatures. Drag a card's six-dot handle to reorder it; drag its bottom grip for graph height, or right-click the grip for half/full width. Layout changes are saved.
+- Control dock includes volume down/up, mute, play/pause, Windows audio-output settings, Task Manager, hardware details, and up to six favorite executable shortcuts. Right-click a favorite to remove it.
+- **Settings → Theme** offers Cyan/Violet/Green/Amber accents, edge glow, text size, circular-gauge visibility, and the existing opacity control under Appearance.
+- Hardware page reads processor/graphics names, usable RAM, memory modules, physical drives, OS and uptime locally. Slow Windows inventory runs off the interface thread.
+- Gaming overlay shows live CPU/GPU/RAM and temperatures above windowed/borderless games; exclusive fullscreen may hide it. Optional PresentMon enables measured game FPS.
 - Dashboard status strip distinguishes current resource pressure from sensor-provider availability. **All graphs** changes every time range together; individual cards can still be adjusted separately.
 - **Export CSV** saves up to one hour of actual collected samples with UTC timestamps, units, and explicit unavailable values. Export stays local and excludes process lists. History is cleared when the app restarts.
 - Click CPU, RAM, disk space or GPU headings to expand details and a history graph. Expanded cards are remembered. Choose 5 minutes, 30 minutes or 1 hour; hover for exact recorded values and sample times.
@@ -23,7 +28,7 @@ A standalone PySide6 desktop widget for Windows. It shows live computer readings
 - Saved settings, transparency, compact view, position lock and always-on-top.
 - Single instance per project folder. Reopening the launcher focuses the existing window.
 
-The project contains only computer monitoring. It is separate from any other desktop widgets.
+The project contains computer monitoring and local Windows controls. It is separate from other desktop widgets.
 
 ## Run on Windows
 
@@ -65,17 +70,35 @@ Unavailable readings show **N/A**. No temperatures or GPU activity are fabricate
 
 ## Reading the numbers
 
+### Optional real FPS capture
+
+Download the [official Intel PresentMon console](https://github.com/GameTechDev/PresentMon/releases/tag/v2.6.0) and place `PresentMon-2.6.0-x64.exe` in `tools/`, or choose it inside **Gaming overlay**. The binary is not included in Git. Open a game, select its process, and click **Start game FPS capture**. Capture may require starting PC Monitor with Windows administrator approval or existing Performance Log Users membership; the app does not change permissions or auto-elevate.
+
+FPS comes from PresentMon frame intervals for the selected process's busiest swap chain over the last two seconds. Missing/stopped captures show N/A; the screen's refresh rate is never substituted. Closing the overlay or the main app stops its capture process. Hardware readings work without PresentMon.
+
+No game installed? Use **Run graphics FPS test** in Gaming overlay. It opens a small animated Direct3D scene and measures its actual presentation intervals; its animation timer is never used as an FPS reading. Search/select a game's rendering process when testing a real game.
+
+If Windows denies the trace, **Restart with Windows approval** offers a one-session administrator restart and opens the test automatically after approval. The entire app (including apps launched from its dock) then runs with administrator access until closed. Declining or canceling leaves the normal instance open. No Windows group, scheduled task, startup setting or persistent permission is changed.
+
+### Hardware readings
+
+- **Network Quality:** in-app quick download/upload estimates via Cloudflare (up to 25 MB), ping/jitter/ICMP loss checks, latency history, adapter link speed, Stop and Copy Results. Optional quality monitoring runs every 30 seconds; speed tests run only when clicked. Blocked ICMP can look like packet loss.
+- **Gaming overlay:** mean/peak frame-time history and 1% low FPS from the slowest 1% of recent frames (30 seconds, up to 4,000 frames; at least 100 required). The built-in graphics test measures its own rendered frames without requiring PresentMon.
+- **Themes:** NASA Mission Control, Matrix, Amber CRT and Deep Space are available in Settings → Theme.
+- **Custom alerts:** enable thresholds, sustained-high duration and optional sound in Settings → Alerts. Alerts appear in the app; repeated notifications are limited to once per metric every five minutes.
+- **Movable panels:** Layout offers freely movable/resizable panels, saved positions, Arrange, Keep Together and Reset. Disk Activity is in the dashboard's right column.
+
 - Network speed is current traffic on the selected PC adapter. It is not a speed test, the connection's maximum speed, or whole-home/router usage. Virtual adapters can count the same traffic again, so select the intended adapter when needed.
 - Mbps means megabits per second; MB/s means megabytes per second. 8 Mbps equals 1 MB/s.
 - Disk space is used capacity; disk activity is combined I/O across all disks.
 - GPU usage is the busiest exposed GPU Core/D3D engine on the selected adapter; memory fullness is excluded. A truly idle GPU can show 0%.
 - CPU frequency uses exposed core clocks when available; the Windows fallback can be a nominal reported frequency.
-- Temperatures are not averaged. Brief sensor gaps retain the last reading for up to five seconds, with older samples labeled as last readings.
+- Temperatures are not averaged. Fans & Temperatures shows all discovered fan/temperature sensors; missing or older-than-two-second samples show N/A. Warning/critical reference limits are excluded from live readings. CPU/GPU gauges can retain brief gaps with a last-reading label. Temperature history preserves unavailable samples as gaps.
 - Top-app CPU percentages are normalized to total processor capacity. Protected processes may be inaccessible.
 
 ## Local settings and privacy
 
-Settings and window/list positions are saved beside the script in `pc_monitor_settings.json`. These files, environments, logs, shortcuts and compiled executables are excluded from Git. The app reads a local sensor service and Windows counters; it does not upload readings or process lists.
+Settings and window/list positions are saved beside the script in `pc_monitor_settings.json`. These files, environments, logs, shortcuts and compiled executables are excluded from Git. The app reads a local sensor service and Windows counters; it does not upload hardware readings or process lists. User-triggered network tests contact Cloudflare or Google; optional quality monitoring repeats ICMP probes. Speed tests transfer generated data to/from Cloudflare and expose your connection's public IP to that service.
 
 ## Checks
 

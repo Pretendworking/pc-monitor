@@ -20,6 +20,7 @@ import urllib.request
 from pathlib import Path
 
 import psutil
+import pc_extras as extras
 from PySide6.QtCore import Qt, QTimer, QLockFile, QMimeData, QPointF, QRectF
 from PySide6.QtGui import QColor, QPainter, QPen, QIcon, QDrag, QPainterPath, QLinearGradient
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -46,6 +47,10 @@ DEFAULTS.update(separate_panels=False, panel_positions={}, monitor_order=[key fo
 DEFAULTS.update(network_adapter='', network_unit='Mbps')
 DEFAULTS.update(history_cpu=False, history_ram=False, history_disk=False, history_gpu=False)
 DEFAULTS.update(dashboard=True, dashboard_width=1100, dashboard_height=780)
+DEFAULTS.update(accent='Cyan', glow=45, text_size=13, gauges=True, card_heights={},
+                card_spans={}, dashboard_order=['cpu', 'gpu', 'ram', 'disk'], favorite_apps=[], presentmon_path='')
+DEFAULTS.update(floating_enabled=False, alerts_enabled=False, alert_sound=False,
+                alert_cpu=90, alert_ram=90, alert_cpu_temp=185, alert_gpu_temp=185, alert_seconds=15)
 def set_windows_startup(enabled):
     """Called only when the user saves a changed Start with Windows setting."""
     if os.name != 'nt':
@@ -68,6 +73,9 @@ def set_windows_startup(enabled):
 def load_settings():
     result = dict(DEFAULTS)
     result['panel_positions'] = {}
+    result['card_heights'] = {}
+    result['card_spans'] = {}
+    result['favorite_apps'] = []
     try:
         saved = json.loads(CONFIG.read_text(encoding='utf-8'))
         if not isinstance(saved, dict):
@@ -83,11 +91,26 @@ def load_settings():
     except (OSError, ValueError):
         pass
     # This widget uses one reorderable list; migrate the previous floating layout.
-    result['separate_panels'] = False
+    result['separate_panels'] = result['floating_enabled']
+    for key, low, high in [('alert_cpu', 1, 100), ('alert_ram', 1, 100),
+                           ('alert_cpu_temp', 80, 230), ('alert_gpu_temp', 80, 230), ('alert_seconds', 5, 300)]:
+        result[key] = max(low, min(high, result[key]))
     order = result.get('monitor_order', [])
     valid = [key for key, _ in MONITORS]
     result['monitor_order'] = list(dict.fromkeys(key for key in order if isinstance(key, str) and key in valid))
     result['monitor_order'].extend(key for key in valid if key not in result['monitor_order'])
+    result['dashboard_order'] = list(dict.fromkeys(key for key in result['dashboard_order']
+                                                if isinstance(key, str) and key in ('cpu', 'gpu', 'ram', 'disk')))
+    result['dashboard_order'].extend(key for key in ('cpu', 'gpu', 'ram', 'disk') if key not in result['dashboard_order'])
+    result['favorite_apps'] = [path for path in result['favorite_apps'] if isinstance(path, str) and Path(path).suffix.lower() == '.exe'][:6]
+    result['card_heights'] = {key: max(90, min(300, height)) for key, height in result['card_heights'].items()
+                             if key in ('cpu', 'gpu', 'ram', 'disk') and type(height) is int}
+    result['card_spans'] = {key: span for key, span in result['card_spans'].items()
+                           if key in ('cpu', 'gpu', 'ram', 'disk') and type(span) is int and span in (1, 2)}
+    result['glow'] = max(0, min(100, result['glow']))
+    result['text_size'] = max(10, min(16, result['text_size']))
+    if result['accent'] not in extras.ACCENTS:
+        result['accent'] = 'Cyan'
     return result
 
 
@@ -171,6 +194,46 @@ class SettingsDialog(QDialog):
         monitoring_layout.addLayout(actions)
         monitoring_layout.addStretch()
         tabs.addTab(monitoring, 'Monitoring')
+        theme = QWidget()
+        theme_form = QFormLayout(theme)
+        self.accent = QComboBox()
+        self.accent.addItems(list(extras.ACCENTS))
+        self.accent.setCurrentText(monitor.options['accent'])
+        theme_form.addRow('Theme / accent', self.accent)
+        for key, title, low, high in [('glow', 'Edge glow', 0, 100), ('text_size', 'Text size', 10, 16)]:
+            control = QSpinBox()
+            control.setRange(low, high)
+            control.setValue(monitor.options[key])
+            self.controls[key] = control
+            theme_form.addRow(title, control)
+        gauges = QCheckBox('Circular CPU / GPU gauges')
+        gauges.setChecked(monitor.options['gauges'])
+        self.controls['gauges'] = gauges
+        theme_form.addRow(gauges)
+        tabs.addTab(theme, 'Theme')
+        alerts = QWidget()
+        alerts_form = QFormLayout(alerts)
+        for key, title in [('alerts_enabled', 'Enable custom alerts'), ('alert_sound', 'Play a sound for new alerts')]:
+            control = QCheckBox(title)
+            control.setChecked(monitor.options[key])
+            self.controls[key] = control
+            alerts_form.addRow(control)
+        for key, title, low, high, suffix in [
+                ('alert_cpu', 'CPU usage', 1, 100, '%'), ('alert_ram', 'Memory usage', 1, 100, '%'),
+                ('alert_cpu_temp', 'CPU temperature', 80, 230, ' °F'),
+                ('alert_gpu_temp', 'GPU temperature', 80, 230, ' °F'),
+                ('alert_seconds', 'Must stay high for', 5, 300, ' sec')]:
+            control = QSpinBox()
+            control.setRange(low, high)
+            control.setSuffix(suffix)
+            control.setValue(monitor.options[key])
+            self.controls[key] = control
+            alerts_form.addRow(title, control)
+        alert_help = QLabel('Alerts appear in the dashboard. Missing sensors do not trigger alerts.\nRepeat alerts are limited to once per metric every 5 minutes.\n\nRecent alerts this session:\n' + ('\n'.join(list(monitor.alerts.history)[:6]) or 'None yet.'))
+        alert_help.setWordWrap(True)
+        alert_help.setTextFormat(Qt.TextFormat.PlainText)
+        alerts_form.addRow(alert_help)
+        tabs.addTab(alerts, 'Alerts')
         layout.addWidget(tabs)
         note = QLabel('Colors: blue below 50% · yellow 50–79.9% · red 80%+\n'
                       'Unavailable hardware sensors display N/A.')
@@ -200,6 +263,7 @@ class SettingsDialog(QDialog):
         result['drive'] = self.drive.currentText()
         result['network_adapter'] = self.network_adapter.currentData()
         result['network_unit'] = self.network_unit.currentData()
+        result['accent'] = self.accent.currentText()
         return result
 
 
@@ -701,6 +765,34 @@ class ReorderList(QWidget):
             painter.drawLine(0, round(self.drop_y), self.width(), round(self.drop_y))
 
 
+class DashboardGridArea(ReorderList):
+    def scroll_during_drag(self):
+        bar = self.monitor.dashboard_scroll.verticalScrollBar()
+        bar.setValue(bar.value() + self.scroll_direction * 12)
+
+    def dragMoveEvent(self, event):
+        if self.accepts(event):
+            viewport = self.monitor.dashboard_scroll.viewport()
+            y = self.mapTo(viewport, event.position().toPoint()).y()
+            self.scroll_direction = -1 if y < 35 else 1 if y > viewport.height() - 35 else 0
+            self.auto_scroll.start() if self.scroll_direction else self.auto_scroll.stop()
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+
+    def dropEvent(self, event):
+        self.auto_scroll.stop()
+        if self.accepts(event):
+            key = bytes(event.mimeData().data(ROW_MIME)).decode('ascii')
+            candidates = [(name, meter) for name, meter in self.monitor.meters.items()
+                          if name != key and not meter.isHidden()]
+            if candidates:
+                point = event.position().toPoint()
+                target = min(candidates, key=lambda pair: (pair[1].geometry().center() - point).manhattanLength())[0]
+                self.monitor.move_monitor(key, target)
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+
+
 class HistoryGraph(QWidget):
     """Bounded, timestamped local history. Missing samples break the line."""
     WINDOW = 300
@@ -787,7 +879,7 @@ class HistoryGraph(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor('#07151e'))
+        painter.setBrush(QColor(getattr(self, 'theme_background', '#07151e')))
         painter.drawRoundedRect(QRectF(self.rect()), 8, 8)
         plot = QRectF(12, 26, max(20, self.width() - 24), self.height() - 65)
         now = time.monotonic()
@@ -802,7 +894,7 @@ class HistoryGraph(QWidget):
         for fraction in (0, .5, 1):
             y = plot.bottom() - plot.height() * fraction
             painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
-        palette = ('#35d9ee', '#67dfb2')
+        palette = (getattr(self, 'accent', '#35d9ee'), '#67dfb2')
         for index, name in enumerate(self.series):
             painter.setPen(QPen(QColor(palette[index % 2]), 1.8))
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1082,6 +1174,39 @@ def history_rows(graphs, now):
     return sorted(rows, key=lambda row: (row[0], row[1], row[2]))
 
 
+def live_sensor_lines(data, known, temperatures=True):
+    """Keep discovered sensor labels, but never display stale values as live."""
+    current = {}
+    for sensor in data.get('hardware', []):
+        kind = sensor.get('kind')
+        name = str(sensor.get('name', 'Sensor'))
+        if kind not in ('fan', 'temperature') or any(word in name.lower() for word in ('warning', 'critical', 'limit', 'threshold')):
+            continue
+        key = sensor.get('id') or (sensor.get('device', 'Hardware'), kind, name)
+        known[key] = dict(sensor)
+        if data.get('hardware_age', 0) <= 2:
+            current[key] = number(sensor.get('value'))
+    lines = []
+    for key, label in (('cpu_temp', 'CPU temperature'), ('gpu_temp', 'GPU temperature')):
+        value = number(data.get(key)) if temperatures and data.get(key + '_age', 0) <= 2 else None
+        lines.append(label + ': ' + fahrenheit(value))
+    for key, sensor in sorted(known.items(), key=lambda item: (str(item[1].get('device', '')), str(item[1].get('name', '')))):
+        value = current.get(key)
+        if sensor['kind'] == 'temperature':
+            reading = fahrenheit(value) if temperatures else 'N/A'
+        else:
+            reading = f'{value:.0f} RPM' if value is not None else 'N/A'
+        lines.append(f"{sensor.get('device', 'Hardware')} · {sensor.get('name', 'Sensor')}: {reading}")
+    if not any(sensor['kind'] == 'fan' for sensor in known.values()):
+        lines.append('Fans: N/A')
+    for title, tokens in [('Motherboard temperature', ('lpc', 'motherboard', 'mainboard')),
+                           ('Storage temperature', ('nvme', 'hdd', 'ssd', 'storage'))]:
+        if not any(sensor['kind'] == 'temperature' and any(token in (str(sensor.get('id', '')) + str(sensor.get('device', ''))).lower()
+                   for token in tokens) for sensor in known.values()):
+            lines.append(title + ': N/A')
+    return lines
+
+
 def sensor_status(data):
     if not data.get('hardware'):
         return 'SENSORS UNAVAILABLE'
@@ -1091,7 +1216,14 @@ def sensor_status(data):
 class Monitor(QWidget):
     def __init__(self):
         super().__init__()
+        self.root = ROOT
         self.options = load_settings()
+        self.alerts = extras.SustainedAlerts()
+        self.known_sensors = {}
+        self.fps_reader = extras.FpsReader(self)
+        self.overlay_window = None
+        self.fps_scene = None
+        self.hardware_page = None
         self.closing = False
         self.panels = {}
         self.floating_active = False
@@ -1116,6 +1248,15 @@ class Monitor(QWidget):
         self.view_button.setStyleSheet('font-size: 12px; color: #70efff; padding: 5px;')
         self.view_button.clicked.connect(self.toggle_dashboard)
         title.addWidget(self.view_button)
+        layout_button = QPushButton('Layout')
+        layout_button.setStyleSheet('font-size: 12px; color: #70efff; padding: 5px;')
+        layout_menu = extras.QMenu(layout_button)
+        layout_menu.addAction('Move panels freely', self.float_panels)
+        layout_menu.addAction('Keep panels together', self.dock_panels)
+        layout_menu.addAction('Arrange floating panels', self.arrange_panels)
+        layout_menu.addAction('Reset dashboard layout', self.reset_layout)
+        layout_button.setMenu(layout_menu)
+        title.addWidget(layout_button)
         settings = QPushButton('Settings')
         settings.setStyleSheet('font-size: 12px; padding: 5px; color: #51e0ef;')
         settings.setToolTip('Appearance and monitoring settings')
@@ -1127,6 +1268,12 @@ class Monitor(QWidget):
         close.clicked.connect(self.close)
         title.addWidget(close)
         layout.addLayout(title)
+        self.alert_banner = QLabel()
+        self.alert_banner.setWordWrap(True)
+        self.alert_banner.setTextFormat(Qt.TextFormat.PlainText)
+        self.alert_banner.setStyleSheet('color: #ffcf86; background: #382412; border: 1px solid #c9863a; padding: 8px; border-radius: 5px;')
+        self.alert_banner.hide()
+        layout.addWidget(self.alert_banner)
         self.diagnostic_dialog = None
         self.current_readings = {}
         self.current_sensor_data = {}
@@ -1159,6 +1306,8 @@ class Monitor(QWidget):
         export.clicked.connect(self.export_history)
         tools.addWidget(export)
         layout.addWidget(self.dashboard_toolbar)
+        self.control_dock = extras.ControlDock(self)
+        layout.addWidget(self.control_dock)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1195,8 +1344,27 @@ class Monitor(QWidget):
         self.network_graph = HistoryGraph(('Download', 'Upload'), 'Mbps', ceiling=None)
         self.network_history_adapter = None
         self.sections['network'].body_layout.addWidget(self.network_graph)
+        self.network_quality = extras.NetworkQuality(self)
+        self.sections['network'].body_layout.addWidget(self.network_quality)
+        self.temperature_graph = HistoryGraph(('CPU', 'GPU'), 'Temperature · °F', ceiling=None)
+        self.temperature_graph.setFixedHeight(150)
+        self.sections['hardware'].body_layout.addWidget(self.temperature_graph)
         for graph in self.history_graphs().values():
             graph.range_selector.currentIndexChanged.connect(self.sync_global_range)
+        for key, meter in self.meters.items():
+            if key in ('cpu', 'gpu'):
+                meter.dial = extras.Dial(self, key)
+                meter.dial.setFixedWidth(112)
+                meter.visual_row = QWidget()
+                visual_layout = QHBoxLayout(meter.visual_row)
+                visual_layout.setContentsMargins(0, 0, 0, 0)
+                visual_layout.setSpacing(6)
+                meter.layout().removeWidget(meter.graph)
+                visual_layout.addWidget(meter.dial)
+                visual_layout.addWidget(meter.graph, 1)
+                meter.layout().addWidget(meter.visual_row)
+            meter.card_sizer = extras.CardSizer(self, key, meter.graph)
+            meter.layout().addWidget(meter.card_sizer)
         self.core_grid = QFormLayout()
         self.sections['cores'].body_layout.addLayout(self.core_grid)
         content_layout.addStretch()
@@ -1213,9 +1381,10 @@ class Monitor(QWidget):
         self.dashboard_grid.setSpacing(12)
         self.dashboard_grid.setColumnStretch(0, 1)
         self.dashboard_grid.setColumnStretch(1, 1)
-        main_cards = QWidget()
+        main_cards = DashboardGridArea(self)
         main_cards.setLayout(self.dashboard_grid)
         main_scroll = QScrollArea()
+        self.dashboard_scroll = main_scroll
         main_scroll.setWidgetResizable(True)
         main_scroll.setFrameShape(QFrame.Shape.NoFrame)
         main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1291,7 +1460,43 @@ class Monitor(QWidget):
         self.save_settings()
 
     def history_graphs(self):
-        return {**{key: meter.graph for key, meter in self.meters.items()}, 'network': self.network_graph}
+        return {**{key: meter.graph for key, meter in self.meters.items()}, 'network': self.network_graph,
+                'temperature': self.temperature_graph, 'latency': self.network_quality.graph}
+
+    def open_hardware(self):
+        if self.hardware_page is not None and self.hardware_page.isVisible():
+            self.hardware_page.raise_()
+            return
+        if self.hardware_page is not None:
+            self.hardware_page.deleteLater()
+        self.hardware_page = extras.HardwarePage(self)
+        extras.apply_theme(self)
+        self.hardware_page.show()
+
+    def open_overlay(self):
+        dialog = extras.OverlaySetup(self)
+        extras.apply_theme(self)
+        dialog.show()
+
+    def start_fps_test(self):
+        if self.fps_scene is None or not self.fps_scene.isVisible():
+            if self.fps_scene is not None:
+                self.fps_scene.deleteLater()
+            self.fps_scene = extras.create_fps_test(self)
+        if self.fps_scene is None:
+            return
+        self.fps_scene.raise_()
+        self.fps_reader.start_test()
+        self.show_overlay()
+
+    def show_overlay(self):
+        if self.overlay_window is not None and self.overlay_window.isVisible():
+            self.overlay_window.raise_()
+            return
+        if self.overlay_window is not None:
+            self.overlay_window.deleteLater()
+        self.overlay_window = extras.GamingOverlay(self)
+        self.overlay_window.show()
 
     def set_all_graph_ranges(self, index):
         if index < 0:
@@ -1397,7 +1602,7 @@ class Monitor(QWidget):
 
     def save_settings(self):
         self.options.update(x=self.x(), y=self.y())
-        if self.options['dashboard']:
+        if self.options['dashboard'] and not self.options['separate_panels']:
             self.options.update(dashboard_width=self.width(), dashboard_height=self.height())
         elif not self.options['separate_panels']:
             self.options.update(width=self.width(), height=self.height())
@@ -1417,12 +1622,26 @@ class Monitor(QWidget):
 
     def apply_order(self):
         widgets = self.panel_widgets()
+        if self.options['separate_panels']:
+            return
         if self.options['dashboard']:
-            for index, key in enumerate(('cpu', 'gpu', 'ram', 'disk')):
-                self.dashboard_grid.addWidget(widgets[key], index // 2, index % 2)
-            self.dashboard_grid.addWidget(widgets['network'], 2, 0, 1, 2)
-            self.dashboard_grid.addWidget(widgets['activity'], 3, 0, 1, 2)
-            for key in ('apps', 'hardware', 'cores', 'graphics', 'battery'):
+            while self.dashboard_grid.count():
+                self.dashboard_grid.takeAt(0)
+            row, column = 0, 0
+            for key in self.options['dashboard_order']:
+                if not self.options['show_' + key]:
+                    continue
+                span = self.options['card_spans'].get(key, 1)
+                if span == 2 and column:
+                    row, column = row + 1, 0
+                self.dashboard_grid.addWidget(widgets[key], row, column, 1, span)
+                column += span
+                if column >= 2:
+                    row, column = row + 1, 0
+            if column:
+                row += 1
+            self.dashboard_grid.addWidget(widgets['network'], row, 0, 1, 2)
+            for key in ('apps', 'hardware', 'activity', 'cores', 'graphics', 'battery'):
                 self.sidebar_layout.addWidget(widgets[key])
             self.sidebar_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
             self.dashboard_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -1431,6 +1650,15 @@ class Monitor(QWidget):
             self.content_layout.insertWidget(index, widgets[key])
 
     def move_monitor(self, key, before=None):
+        if self.options['dashboard'] and key in self.meters:
+            order = self.options['dashboard_order']
+            if before == key:
+                return
+            order.remove(key)
+            order.insert(order.index(before) if before in order else len(order), key)
+            self.apply_order()
+            self.save_settings()
+            return
         order = self.options['monitor_order']
         if key not in order or before == key:
             return
@@ -1462,7 +1690,22 @@ class Monitor(QWidget):
             panel.save_settings()
 
     def dock_panels(self):
+        self.options['floating_enabled'] = False
         self.options['separate_panels'] = False
+        self.apply_settings()
+        self.save_settings()
+
+    def float_panels(self):
+        self.options['floating_enabled'] = True
+        self.options['separate_panels'] = True
+        self.apply_settings()
+        self.save_settings()
+
+    def reset_layout(self):
+        self.options.update(dashboard_order=['cpu', 'gpu', 'ram', 'disk'], card_heights={},
+                            card_spans={}, panel_positions={})
+        if self.options['separate_panels']:
+            self.arrange_panels()
         self.apply_settings()
         self.save_settings()
 
@@ -1521,16 +1764,24 @@ class Monitor(QWidget):
         self.sync_panels()
         self.apply_order()
         dashboard = self.options['dashboard']
-        self.dashboard_toolbar.setVisible(dashboard)
+        self.dashboard_toolbar.setVisible(dashboard and not self.options['separate_panels'])
+        self.control_dock.setVisible(dashboard and not self.options['separate_panels'])
+        self.view_button.setVisible(not self.options['separate_panels'])
         self.view_button.setText('Widget view' if dashboard else 'Dashboard')
         self.view_button.setToolTip('Switch between the dashboard and compact widget')
-        self.dashboard.setVisible(dashboard)
-        self.scroll.setVisible(not dashboard)
-        for handle in self.row_handles.values():
-            handle.setVisible(not dashboard)
+        self.dashboard.setVisible(dashboard and not self.options['separate_panels'])
+        self.scroll.setVisible(not dashboard and not self.options['separate_panels'])
+        for key, handle in self.row_handles.items():
+            handle.setVisible(not self.options['separate_panels'] and (not dashboard or key in self.meters))
+            handle.setToolTip('Drag onto another card to reorder' if dashboard else 'Drag up or down to reorder this item')
         for key, meter in self.meters.items():
             meter.setVisible(self.options['show_' + key])
-            meter.graph.setFixedHeight(105 if dashboard else 155)
+            meter.graph.setFixedHeight(self.options['card_heights'].get(key, 105) if dashboard else 155)
+            meter.card_sizer.setVisible(dashboard)
+            if hasattr(meter, 'dial'):
+                meter.dial.setVisible(dashboard and self.options['gauges'])
+                meter.bar.setVisible(not dashboard or not self.options['gauges'])
+                meter.value.setVisible(not dashboard or not self.options['gauges'])
             if dashboard and not getattr(self, 'dashboard_applied', False):
                 meter.toggle.blockSignals(True)
                 meter.toggle.setChecked(True)
@@ -1557,19 +1808,26 @@ class Monitor(QWidget):
                 section.toggle.blockSignals(False)
                 section.set_expanded(expanded)
         self.network_graph.setFixedHeight(105 if dashboard else 155)
+        if self.options['separate_panels']:
+            for key, section in self.sections.items():
+                section.body.show()
+                section.toggle.hide()
         self.dashboard_applied = dashboard
-        self.setMinimumWidth(900 if dashboard else 320)
+        self.setMinimumWidth(900 if dashboard and not self.options['separate_panels'] else 320)
         self.layout().activate()
         minimum = self.minimumSizeHint()
         area = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         width = min(self.options['dashboard_width'], area.width()) if dashboard else self.options['width']
         height = min(self.options['dashboard_height'], area.height()) if dashboard else (self.options['height'] or 600)
+        if self.options['separate_panels']:
+            width, height = 440, 300
         self.resize(max(width, minimum.width()),
                     max(190 if self.options['separate_panels'] else height,
                         minimum.height()))
         self.update()
         if visible:
             self.show()
+        extras.apply_theme(self)
 
     def reveal(self):
         self.showNormal()
@@ -1611,10 +1869,26 @@ class Monitor(QWidget):
         self.current_readings = dict(cpu=cpu_usage, ram=mem.percent, disk=disk_usage,
                                      gpu=data.get('gpu') if data.get('gpu_age', 0) <= 2 else None)
         self.current_sensor_data = data
+        alert_values = dict(self.current_readings)
+        for key in ('cpu_temp', 'gpu_temp'):
+            value = number(data.get(key))
+            alert_values[key] = value * 1.8 + 32 if value is not None and data.get(key + '_age', 0) <= 2 else None
+        new_alerts = self.alerts.update(alert_values, self.options)
+        if new_alerts and self.options['alert_sound']:
+            QApplication.beep()
+        self.alert_banner.setText('ALERT · ' + '\n'.join(self.alerts.active.values()))
+        self.alert_banner.setVisible(bool(self.alerts.active))
+        self.temperature_graph.add_sample(tuple(
+            value * 1.8 + 32 if self.options['temperatures'] and (value := number(data.get(key + '_temp'))) is not None
+            and data.get(key + '_temp_age', 0) <= 2 else None for key in ('cpu', 'gpu')))
+        for key in ('cpu', 'gpu'):
+            temperature = data.get(key + '_temp') if self.options['temperatures'] else None
+            self.meters[key].dial.set_reading(self.current_readings.get(key), temperature)
         pressure = 'MEMORY HIGH' if mem.percent >= 85 else 'CPU BUSY' if cpu_usage is not None and cpu_usage >= 85 else 'MONITORING'
         self.overview.setText(pressure + '  /  ' + sensor_status(data))
         self.overview.setToolTip(pressure_summary(self.current_readings) + '\nSensor status refers to the external hardware sensor provider.')
         self.refresh_details(data, first)
+        extras.apply_theme(self)
 
     def refresh_details(self, data, first=False):
         now = time.monotonic()
@@ -1641,6 +1915,13 @@ class Monitor(QWidget):
             f"Download   {network_rate(network['download'], self.options['network_unit'])}\n"
             f"Upload        {network_rate(network['upload'], self.options['network_unit'])}\n"
             + ('Current traffic · ' + network['adapter'] if network['adapter'] else 'No active adapter · select one in Settings'))
+        try:
+            adapter = psutil.net_if_stats().get(network['adapter'])
+            if adapter is not None:
+                self.sections['network'].label.setText(self.sections['network'].label.text() +
+                    ('\nLink speed: ' + str(adapter.speed) + ' Mbps (adapter)' if adapter.speed > 0 else '\nLink speed: unavailable'))
+        except (OSError, psutil.Error):
+            pass
         self.sections['network'].label.setToolTip('Actual adapter traffic during the last refresh interval.\n'
                                                  'This is not your connection’s maximum speed.\n'
                                                  'Mbps = megabits/s; MB/s = megabytes/s. 8 Mbps = 1 MB/s.')
@@ -1713,27 +1994,11 @@ class Monitor(QWidget):
                 battery_text += f'\nEstimated remaining: {minutes // 60}h {minutes % 60}m'
         self.sections['battery'].label.setText(battery_text)
 
-        hardware_lines = []
-        if data.get('hardware_age', 0) > 2:
-            hardware_lines.append('Last sensor reading (brief connection gap)')
-        for sensor in sorted(hardware, key=lambda s: (s['device'], s['kind'], s['name'])):
-            if sensor['kind'] == 'fan':
-                value = f"{sensor['value']:.0f} RPM"
-            elif sensor['kind'] == 'temperature' and self.options['temperatures']:
-                value = fahrenheit(sensor['value'])
-            else:
-                continue
-            name = sensor['name']
-            if sensor['kind'] == 'temperature':
-                name = {'warning temperature': 'Warning limit (reference)',
-                        'critical temperature': 'Critical limit (reference)'}.get(name.lower(), name)
-            hardware_lines.append(f"{sensor['device']} · {name}: {value}")
-        if not hardware_lines:
-            hardware_lines = ['Fans and temperature sensors: N/A\nLibre Hardware Monitor supplies supported sensors.']
+        hardware_lines = live_sensor_lines(data, self.known_sensors, self.options['temperatures'])
         self.sections['hardware'].label.setText('\n'.join(hardware_lines))
         self.sections['hardware'].label.setToolTip(
-            'Warning and critical limits are device-reported thresholds, not active alerts.\n'
-            'Composite Temperature and other temperature sensors show current readings.')
+            'Live temperatures and fan speeds from available sensors. Missing or older-than-2-second readings show N/A.\n'
+            'Warning and critical reference limits are excluded because they are not current temperatures.')
 
         app_lines = ['MOST CPU · share of total processor capacity']
         cpu_rows = data.get('top_cpu', [])
@@ -1761,6 +2026,12 @@ class Monitor(QWidget):
         alpha = round(self.options['opacity'] * 2.55)
         background.setColorAt(0, QColor(5, 21, 30, alpha))
         background.setColorAt(1, QColor(4, 11, 20, alpha))
+        if self.options['accent'] in extras.THEMES:
+            _, base, panel, _ = extras.theme_colors(self)
+            for stop, color in ((0, panel), (1, base)):
+                shade = QColor(color)
+                shade.setAlpha(alpha)
+                background.setColorAt(stop, shade)
         painter.setBrush(background)
         painter.setPen(QPen(QColor('#245365'), 1))
         painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 10, 10)
@@ -1769,7 +2040,15 @@ class Monitor(QWidget):
             painter.drawLine(x, 48, x, self.height() - 26)
         for y in range(48, self.height() - 20, 24):
             painter.drawLine(9, y, self.width() - 9, y)
-        painter.setPen(QPen(QColor('#35d9ee'), 2))
+        accent = QColor(extras.ACCENTS.get(self.options['accent'], '#35d9ee'))
+        intensity = self.options['glow']
+        if intensity:
+            glow_color = QColor(accent)
+            glow_color.setAlpha(round(intensity * 0.8))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(glow_color, 6))
+            painter.drawRoundedRect(self.rect().adjusted(4, 4, -4, -4), 10, 10)
+        painter.setPen(QPen(accent, 2))
         for x, y, dx, dy in [(9, 9, 1, 1), (self.width()-9, 9, -1, 1),
                              (9, self.height()-9, 1, -1), (self.width()-9, self.height()-9, -1, -1)]:
             painter.drawLine(x, y, x + dx * 16, y)
@@ -1804,6 +2083,14 @@ class Monitor(QWidget):
 
     def closeEvent(self, event):
         self.closing = True
+        self.network_quality.shutdown()
+        self.fps_reader.stop()
+        if self.fps_scene is not None:
+            self.fps_scene.close()
+        if self.overlay_window is not None:
+            self.overlay_window.close()
+        if self.hardware_page is not None:
+            self.hardware_page.close()
         for panel in self.panels.values():
             panel.close()
         self.timer.stop()
@@ -1818,7 +2105,13 @@ if __name__ == '__main__':
     lock = QLockFile(str(ROOT / 'pc_monitor.lock'))
     lock.setStaleLockTime(0)
     server_name = 'CodexPCMonitor_' + __import__('hashlib').sha256(str(ROOT).lower().encode()).hexdigest()[:20]
-    if not lock.tryLock(0):
+    acquired = lock.tryLock(0)
+    if not acquired and '--fps-admin-restart' in sys.argv:
+        deadline = time.monotonic() + 8
+        while not acquired and time.monotonic() < deadline:
+            time.sleep(.1)
+            acquired = lock.tryLock(0)
+    if not acquired:
         client = QLocalSocket()
         client.connectToServer(server_name)
         if client.waitForConnected(1500):
@@ -1836,6 +2129,8 @@ if __name__ == '__main__':
         widget.reveal()
     server.newConnection.connect(activate_existing)
     widget.show()
+    if '--fps-test' in sys.argv:
+        QTimer.singleShot(700, widget.start_fps_test)
     result = app.exec()
     server.close()
     lock.unlock()
