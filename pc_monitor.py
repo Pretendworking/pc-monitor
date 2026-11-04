@@ -2118,6 +2118,7 @@ if __name__ == '__main__':
             client.disconnectFromServer()
         sys.exit(0)
     server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
     QLocalServer.removeServer(server_name)
     server.listen(server_name)
     widget = Monitor()

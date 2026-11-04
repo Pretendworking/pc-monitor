@@ -16,7 +16,7 @@ A standalone PySide6 desktop widget for Windows. It shows live computer readings
 - Expand Network Speed for download/upload history in Mbps. Changing adapters starts a fresh network history.
 - History stays in memory only, starts when the widget opens, and leaves gaps for unavailable samples or pauses longer than 15 seconds.
 - **What’s slowing my PC?** opens live resource readings and the top three apps by CPU and RAM. High-use hints describe the latest sample, not a confirmed diagnosis. Disk capacity is kept distinct from disk activity.
-- Device-reported warning and critical temperatures are labeled reference limits, separately from current temperatures.
+- Fans & Temperatures shows live sensor values or N/A; warning and critical reference limits are excluded.
 - CPU and RAM usage, disk space and GPU usage.
 - Blue usage bars below 50%, yellow from 50% to below 80%, red at 80% and above.
 - Fahrenheit hardware temperatures when supported, displayed without averaging.
@@ -26,7 +26,7 @@ A standalone PySide6 desktop widget for Windows. It shows live computer readings
 - Checkboxes to choose which monitors appear, expandable sections and saved list order.
 - Drag the blue six-dot handles to reorder items. Drag the window background to move it; drag the bottom-right grip to resize.
 - Saved settings, transparency, compact view, position lock and always-on-top.
-- Single instance per project folder. Reopening the launcher focuses the existing window.
+- Single instance per project folder. A current-user-only local activation channel focuses the existing window when the launcher is reopened.
 
 The project contains computer monitoring and local Windows controls. It is separate from other desktop widgets.
 
@@ -60,7 +60,9 @@ After building, **Settings → Start with Windows** can enable or disable startu
 
 CPU/RAM usage, network and disk counters use [psutil](https://psutil.readthedocs.io/stable/). Battery availability depends on the computer.
 
-For additional GPU data and hardware temperatures/fans, run [Libre Hardware Monitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor). The widget can use its local web server at `http://127.0.0.1:8085/data.json` or its WMI provider. Enable **Options → Remote Web Server → Run** for the web connection. WMI can be queried through Windows without extra Python packages; optional `WMI` and `pywin32` packages provide another connection path.
+For additional GPU data and hardware temperatures/fans, run [Libre Hardware Monitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) with its WMI provider and leave **Options → Remote Web Server → Run** disabled. WMI can be queried locally through Windows without extra Python packages; optional `WMI` and `pywin32` packages provide another connection path. Unsupported or unavailable readings show N/A.
+
+The widget retains compatibility with an existing local sensor endpoint at `http://127.0.0.1:8085/data.json`, but does not enable that server. Libre's web server can listen on all network interfaces, and some versions fall back to all interfaces for unrecognized addresses. Do not assume selecting a loopback address reliably restricts that separate server. See [SECURITY.md](SECURITY.md).
 
 Libre Hardware Monitor must remain running for its readings. To keep it out of the way, use its **Start Minimized**, **Minimize To Tray** and **Run On Windows Startup** options. When available, the launcher invokes Libre's configured `LibreHardwareMonitor` startup task instead of directly requesting elevation on every launch. The sensor application is not bundled.
 
